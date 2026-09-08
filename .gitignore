@@ -1,0 +1,38 @@
+__pycache__/
+*.py[cod]
+
+# Local environments and machine-specific settings.
+.env
+.venv/
+venv/
+env/
+
+# Generated experiment outputs.
+pipeline_runs/
+counterexamples/
+artifacts/
+plots/
+diagnostics/
+backups/
+
+# Model/export artifacts.
+*.pt
+*.pth
+*.onnx
+*.ckpt
+
+# Generated diagnostics and large run products.
+*.csv
+*.png
+*.jpg
+*.jpeg
+*.pdf
+*.log
+
+# Python/editor noise.
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.idea/
+.vscode/
+
