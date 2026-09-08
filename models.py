@@ -139,43 +139,11 @@ class PiNet(nn.Module):
         self.register_buffer("K_matrix", _as_float_tensor(k_matrix))
         self.register_buffer("u_lb", _as_float_tensor(u_lb, shape=(self.u_dim,)))
         self.register_buffer("u_hi", _as_float_tensor(u_hi, shape=(self.u_dim,)))
-        normalized_gate = str(gate_type or "").strip().lower()
-        use_branch_only = normalized_gate in {"branch_only", "nn", "saturated_nn", "tanh_nn"}
-        use_relu_gate = normalized_gate in {"saturated_relu", "relu", "relu_ramp"}
-        use_sigmoid_gate = not (use_branch_only or use_relu_gate)
-        if use_branch_only:
-            c_s = float(c_s if c_s is not None else 0.0)
-            c_nn_off = float(c_nn_off if c_nn_off is not None else c_s)
-            c_sigmoid_center = float(
-                c_sigmoid_center if c_sigmoid_center is not None else c_s
-            )
-            sharpness = float(sharpness if sharpness is not None else 0.0)
-        elif use_sigmoid_gate:
-            if c_sigmoid_center is None:
-                if c_s is None:
-                    raise ValueError("Sigmoid PiNet requires c_sigmoid_center or c_s as the switch center.")
-                c_sigmoid_center = float(c_s)
-            if sharpness is None:
-                raise ValueError("Sigmoid PiNet requires sharpness.")
-            c_s = float(c_s if c_s is not None else c_sigmoid_center)
-            c_nn_off = float(c_nn_off if c_nn_off is not None else c_sigmoid_center)
-        else:
-            if c_nn_off is None or c_s is None:
-                raise ValueError("ReLU PiNet requires c_nn_off and c_s.")
-            c_nn_off = float(c_nn_off)
-            c_s = float(c_s)
-            if not c_s > c_nn_off:
-                raise ValueError(
-                    f"PiNet requires c_s > c_nn_off, got c_s={c_s} and "
-                    f"c_nn_off={c_nn_off}."
-                )
-            c_sigmoid_center = float(
-                c_sigmoid_center if c_sigmoid_center is not None else c_nn_off
-            )
-            sharpness = float(sharpness if sharpness is not None else 100.0)
-
-        self.use_branch_only = bool(use_branch_only)
-        self.use_sigmoid_gate = bool(use_sigmoid_gate)
+        c_s = float(c_s if c_s is not None else 0.0)
+        c_nn_off = float(c_nn_off if c_nn_off is not None else c_s)
+        c_sigmoid_center = float(c_sigmoid_center if c_sigmoid_center is not None else c_s)
+        sharpness = float(sharpness if sharpness is not None else 0.0)
+        self.use_branch_only = True
         self.register_buffer("c_nn_off_tensor", torch.tensor(c_nn_off, dtype=torch.float32))
         self.register_buffer("c_s_tensor", torch.tensor(c_s, dtype=torch.float32))
         self.register_buffer(
@@ -208,43 +176,13 @@ class PiNet(nn.Module):
         return torch.clamp(-(x @ k_matrix.T), min=u_lb, max=u_hi)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.use_branch_only:
-            return self.nn_control(x)
-
-        p_matrix = self.P_matrix.to(device=x.device, dtype=x.dtype)
-        u_lb = self.u_lb.to(device=x.device, dtype=x.dtype)
-        u_hi = self.u_hi.to(device=x.device, dtype=x.dtype)
-
-        nu = (x @ p_matrix * x).sum(dim=-1, keepdim=True)
-        u_nn = self.nn_control(x)
-        u_lin = self.lqr_control(x)
-        if self.use_sigmoid_gate:
-            center = self.c_sigmoid_center_tensor.to(device=x.device, dtype=x.dtype)
-            sharpness = self.sharpness_tensor.to(device=x.device, dtype=x.dtype)
-            nn_gate = torch.sigmoid(sharpness * (nu - center))
-        else:
-            c_nn_off = self.c_nn_off_tensor.to(device=x.device, dtype=x.dtype)
-            c_s = self.c_s_tensor.to(device=x.device, dtype=x.dtype)
-            gate_width = c_s - c_nn_off
-            nn_gate = (F.relu(nu - c_nn_off) - F.relu(nu - c_s)) / gate_width
-        lqr_gate = 1.0 - nn_gate
-        return torch.clamp(nn_gate * u_nn + lqr_gate * u_lin, min=u_lb, max=u_hi)
+        return self.nn_control(x)
 
 
 def load_pinet(checkpoint_path: os.PathLike | str, device: str | torch.device = "cpu") -> PiNet:
     checkpoint = torch.load(checkpoint_path, map_location=device)
     if not isinstance(checkpoint, Mapping) or "model_state_dict" not in checkpoint:
         raise ValueError("PiNet checkpoint must be a dict with model_state_dict and metadata.")
-
-    gate_type = str(checkpoint.get("gate_type", "")).strip().lower()
-    has_branch_only_gate = gate_type in {"branch_only", "nn", "saturated_nn", "tanh_nn"}
-    has_relu_gate = gate_type in {"saturated_relu", "relu", "relu_ramp"} or (
-        not gate_type
-        and ("c_nn_off" in checkpoint or "C_NN_OFF" in checkpoint)
-        and ("c_s" in checkpoint or "C_S" in checkpoint)
-        and "sharpness" not in checkpoint
-        and "c1_eff" not in checkpoint
-    )
     model = PiNet(
         n_dim=checkpoint["n_dim"],
         u_dim=checkpoint["u_dim"],
@@ -254,19 +192,11 @@ def load_pinet(checkpoint_path: os.PathLike | str, device: str | torch.device = 
         u_lb=checkpoint["u_lb"],
         u_hi=checkpoint["u_hi"],
         activation=str(checkpoint.get("activation", checkpoint.get("pi_activation", "tanh"))),
-        c_nn_off=checkpoint.get("c_nn_off", checkpoint.get("C_NN_OFF")) if has_relu_gate else None,
+        c_nn_off=checkpoint.get("c_nn_off", checkpoint.get("C_NN_OFF")),
         c_s=checkpoint.get("c_s", checkpoint.get("C_S")),
-        c_sigmoid_center=(
-            checkpoint.get("c_sigmoid_center", checkpoint.get("c1_eff"))
-            if not (has_branch_only_gate or has_relu_gate)
-            else None
-        ),
-        sharpness=checkpoint.get("sharpness") if not (has_branch_only_gate or has_relu_gate) else None,
-        gate_type=(
-            "branch_only"
-            if has_branch_only_gate
-            else ("saturated_relu" if has_relu_gate else "sigmoid_blend")
-        ),
+        c_sigmoid_center=checkpoint.get("c_sigmoid_center", checkpoint.get("c1_eff")),
+        sharpness=checkpoint.get("sharpness"),
+        gate_type="branch_only",
     )
     state_dict = dict(checkpoint["model_state_dict"])
     state_dict.pop("u_lb", None)

@@ -135,9 +135,6 @@ class PolicyLabelBatch:
     near_optimal_fraction: Optional[torch.Tensor] = None
     feasible_control_fraction: Optional[torch.Tensor] = None
     unmasked_fallback_mask: Optional[torch.Tensor] = None
-    lqr_replacement_mask: Optional[torch.Tensor] = None
-    lqr_relative_gap: Optional[torch.Tensor] = None
-    lqr_clip_fraction: Optional[torch.Tensor] = None
     decisive_mask: Optional[torch.Tensor] = None
     neighbor_imputed_mask: Optional[torch.Tensor] = None
     midpoint_default_mask: Optional[torch.Tensor] = None
@@ -904,10 +901,6 @@ def compute_optimal_next_omega_grid_labels(
     resolve_ambiguous_for_policy: bool = False,
     near_optimal_rel_tol: float = 1e-2,
     compute_control_confidence: bool = False,
-    label_selection_mode: str = "argmin",
-    k_matrix: Optional[torch.Tensor] = None,
-    lqr_near_optimal_rel_tol: float = 1e-2,
-    lqr_min_clip_fraction: float = 1e-3,
     mask_out_of_domain_successors: bool = False,
     successor_domain: Optional[Tuple[Tuple[float, float], ...]] = None,
 ) -> PolicyLabelBatch:
@@ -930,18 +923,9 @@ def compute_optimal_next_omega_grid_labels(
         raise ValueError("state_batch_size must be positive.")
     if control_chunk_size <= 0:
         raise ValueError("control_chunk_size must be positive.")
-    mode = normalize_policy_label_selection_mode(label_selection_mode)
     near_optimal_rel_tol = float(near_optimal_rel_tol)
     if near_optimal_rel_tol < 0.0:
         raise ValueError("near_optimal_rel_tol must be nonnegative.")
-    lqr_near_optimal_rel_tol = float(lqr_near_optimal_rel_tol)
-    if lqr_near_optimal_rel_tol < 0.0:
-        raise ValueError("lqr_near_optimal_rel_tol must be nonnegative.")
-    lqr_min_clip_fraction = float(lqr_min_clip_fraction)
-    if lqr_min_clip_fraction < 0.0:
-        raise ValueError("lqr_min_clip_fraction must be nonnegative.")
-    if mode == "prefer_clipped_lqr_when_near_optimal" and k_matrix is None:
-        raise ValueError("k_matrix is required for prefer_clipped_lqr_when_near_optimal labels.")
     if mask_out_of_domain_successors and successor_domain is None:
         successor_domain = tuple(zip(system.x_lb, system.x_hi))
 
@@ -955,9 +939,6 @@ def compute_optimal_next_omega_grid_labels(
     near_fraction_chunks = []
     feasible_fraction_chunks = []
     fallback_mask_chunks = []
-    lqr_replacement_chunks = []
-    lqr_relative_gap_chunks = []
-    lqr_clip_fraction_chunks = []
     midpoint_value_chunks = []
     midpoint = torch.tensor(
         [(lo + hi) / 2.0 for lo, hi in zip(system.u_lb, system.u_hi)],
@@ -966,9 +947,7 @@ def compute_optimal_next_omega_grid_labels(
     )
     u_lb = torch.tensor(system.u_lb, device=device, dtype=dtype)
     u_hi = torch.tensor(system.u_hi, device=device, dtype=dtype)
-    control_scale = (u_hi - u_lb).clamp_min(1e-12)
-    k_matrix = k_matrix.to(device=device, dtype=dtype) if k_matrix is not None else None
-    need_landscape = bool(compute_control_confidence or mode == "prefer_clipped_lqr_when_near_optimal")
+    need_landscape = bool(compute_control_confidence)
 
     for start in range(0, x.shape[0], state_batch_size):
         xb = x[start : start + state_batch_size]
@@ -1025,33 +1004,6 @@ def compute_optimal_next_omega_grid_labels(
         selected_controls = best_controls
         selected_values = best_values
         value_range = (worst_values - best_values).clamp_min(1e-12) if need_landscape else None
-        if mode == "prefer_clipped_lqr_when_near_optimal":
-            assert k_matrix is not None
-            u_lqr_raw = -(xb @ k_matrix.transpose(0, 1))
-            u_lqr = torch.maximum(torch.minimum(u_lqr_raw, u_hi), u_lb)
-            per_dim_clip_fraction = torch.abs((u_lqr_raw - u_lqr) / control_scale)
-            clip_fraction = torch.sqrt((per_dim_clip_fraction**2).mean(dim=-1))
-            all_components_clipped = (per_dim_clip_fraction >= lqr_min_clip_fraction).all(dim=-1)
-            lqr_next = system.dynamics(xb, u_lqr)
-            lqr_values = omega.query(lqr_next).reshape(-1)
-            assert value_range is not None
-            lqr_relative_gap = (lqr_values - best_values) / value_range
-            lqr_feasible = (
-                points_in_bounds(lqr_next, successor_domain)
-                if mask_out_of_domain_successors and successor_domain is not None
-                else torch.ones((bsz,), device=device, dtype=torch.bool)
-            )
-            replacement_mask = all_components_clipped & (
-                lqr_values <= best_values + lqr_near_optimal_rel_tol * value_range
-            ) & lqr_feasible
-            if replacement_mask.any():
-                selected_controls = best_controls.clone()
-                selected_values = best_values.clone()
-                selected_controls[replacement_mask] = u_lqr[replacement_mask]
-                selected_values[replacement_mask] = lqr_values[replacement_mask]
-            lqr_replacement_chunks.append(replacement_mask.detach())
-            lqr_relative_gap_chunks.append(lqr_relative_gap.detach())
-            lqr_clip_fraction_chunks.append(clip_fraction.detach())
 
         if compute_control_confidence:
             assert value_range is not None
@@ -1077,9 +1029,6 @@ def compute_optimal_next_omega_grid_labels(
     near_optimal_fraction = torch.cat(near_fraction_chunks, dim=0) if near_fraction_chunks else None
     feasible_control_fraction = torch.cat(feasible_fraction_chunks, dim=0) if feasible_fraction_chunks else None
     unmasked_fallback_mask = torch.cat(fallback_mask_chunks, dim=0) if fallback_mask_chunks else None
-    lqr_replacement_mask = torch.cat(lqr_replacement_chunks, dim=0) if lqr_replacement_chunks else None
-    lqr_relative_gap = torch.cat(lqr_relative_gap_chunks, dim=0) if lqr_relative_gap_chunks else None
-    lqr_clip_fraction = torch.cat(lqr_clip_fraction_chunks, dim=0) if lqr_clip_fraction_chunks else None
     if not resolve_ambiguous_for_policy:
         return PolicyLabelBatch(
             x=x,
@@ -1089,9 +1038,6 @@ def compute_optimal_next_omega_grid_labels(
             near_optimal_fraction=near_optimal_fraction,
             feasible_control_fraction=feasible_control_fraction,
             unmasked_fallback_mask=unmasked_fallback_mask,
-            lqr_replacement_mask=lqr_replacement_mask,
-            lqr_relative_gap=lqr_relative_gap,
-            lqr_clip_fraction=lqr_clip_fraction,
         )
 
     midpoint_values = torch.cat(midpoint_value_chunks, dim=0)
@@ -1134,9 +1080,6 @@ def compute_optimal_next_omega_grid_labels(
         near_optimal_fraction=near_optimal_fraction,
         feasible_control_fraction=feasible_control_fraction,
         unmasked_fallback_mask=unmasked_fallback_mask,
-        lqr_replacement_mask=lqr_replacement_mask,
-        lqr_relative_gap=lqr_relative_gap,
-        lqr_clip_fraction=lqr_clip_fraction,
         decisive_mask=decisive_mask,
         neighbor_imputed_mask=neighbor_imputed_mask,
         midpoint_default_mask=midpoint_default_mask,
@@ -1149,27 +1092,10 @@ def normalize_policy_label_selection_mode(mode: str) -> str:
         "raw": "argmin",
         "grid_argmin": "argmin",
         "min": "argmin",
-        "near_optimal_min_norm": "near_optimal_weighted_control",
-        "near_optimal_min_effort": "near_optimal_weighted_control",
-        "min_norm_near_optimal": "near_optimal_weighted_control",
-        "near_optimal": "near_optimal_weighted_control",
-        "weighted": "near_optimal_weighted_control",
-        "confidence_weighted": "near_optimal_weighted_control",
-        "prefer_lqr": "prefer_clipped_lqr_when_near_optimal",
-        "clipped_lqr": "prefer_clipped_lqr_when_near_optimal",
-        "lqr_when_near_optimal": "prefer_clipped_lqr_when_near_optimal",
     }
     normalized = aliases.get(normalized, normalized)
-    if normalized not in {
-        "argmin",
-        "near_optimal_weighted_control",
-        "prefer_clipped_lqr_when_near_optimal",
-    }:
-        raise ValueError(
-            "policy label_selection_mode must be 'argmin', "
-            "'near_optimal_weighted_control', or "
-            f"'prefer_clipped_lqr_when_near_optimal', got {mode!r}."
-        )
+    if normalized != "argmin":
+        raise ValueError(f"policy label_selection_mode must be 'argmin', got {mode!r}.")
     return normalized
 
 
@@ -3506,169 +3432,6 @@ def sample_omega_rejection_points(
     return samples, stats
 
 
-def project_to_bounds_(x: torch.Tensor, bounds: Tuple[Tuple[float, float], ...]) -> None:
-    """In-place projection onto a closed hyperrectangle."""
-    with torch.no_grad():
-        for d, (lo, hi) in enumerate(bounds):
-            x[:, d].clamp_(float(lo), float(hi))
-
-
-def sample_omega_optimized_points(
-    omega: OmegaNet,
-    bounds: Tuple[Tuple[float, float], ...],
-    count: int,
-    *,
-    device: torch.device,
-    mode: str,
-    sublevel: float,
-    batch_size: int,
-    steps: int = 80,
-    lr: float = 5e-2,
-    max_attempts: int = 6,
-    strict_sublevel: bool = False,
-) -> Tuple[torch.Tensor, Dict[str, object]]:
-    """Generate states by projected gradient descent on learned omega objectives.
-
-    `mode="sublevel"` minimizes relu(omega(x)-sublevel) and returns points inside
-    the requested learned DOS whenever enough are found. `mode="outer"` minimizes
-    |omega(x)-1| and returns the best points by final objective value.
-    """
-    if count <= 0:
-        return torch.empty(0, len(bounds), device=device), {
-            "mode": mode,
-            "requested_points": int(count),
-            "returned_points": 0,
-            "sublevel": float(sublevel),
-            "attempts": 0,
-        }
-    if mode not in {"sublevel", "outer"}:
-        raise ValueError(f"Unknown optimized omega sampling mode {mode!r}.")
-
-    omega.eval()
-    batch_size = max(1, int(batch_size))
-    chunks: List[torch.Tensor] = []
-    scored_chunks: List[Tuple[torch.Tensor, torch.Tensor]] = []
-    attempts = 0
-    max_batches = max(int(max_attempts), int(max_attempts) * max(1, math.ceil(count / batch_size)))
-    total_initial_points = 0
-    accepted_points = 0
-
-    while accepted_points < count and attempts < max_batches:
-        attempts += 1
-        remaining = count - accepted_points
-        n_batch = min(batch_size, max(batch_size, 2 * remaining))
-        x = sample_uniform_bounds(bounds, n_batch, device=device).detach()
-        x.requires_grad_(True)
-        opt = torch.optim.Adam([x], lr=float(lr))
-
-        for _ in range(int(steps)):
-            opt.zero_grad()
-            values = omega.query(x).reshape(-1)
-            if mode == "sublevel":
-                loss = torch.relu(values - float(sublevel)).mean()
-            else:
-                loss = torch.abs(values - 1.0).mean()
-            loss.backward()
-            opt.step()
-            project_to_bounds_(x, bounds)
-
-        with torch.no_grad():
-            x_final = x.detach()
-            values = omega.query(x_final).reshape(-1)
-            if mode == "sublevel":
-                mask = values <= float(sublevel)
-                accepted = x_final[mask]
-                if accepted.shape[0] > 0:
-                    take = min(remaining, accepted.shape[0])
-                    chunks.append(accepted[:take].detach())
-                    accepted_points += take
-            else:
-                score = torch.abs(values - 1.0)
-                scored_chunks.append((score.detach().cpu(), x_final.detach().cpu()))
-                accepted_points = min(count, sum(int(points.shape[0]) for _, points in scored_chunks))
-            total_initial_points += int(n_batch)
-
-    if mode == "sublevel":
-        if accepted_points < count and not strict_sublevel:
-            fallback_need = count - accepted_points
-            if scored_chunks:
-                raise RuntimeError("Internal sampler state error: sublevel mode should not collect scored chunks.")
-            # If strict sublevel search undershoots, use the best remaining
-            # optimized candidates rather than silently returning too few labels.
-            best_scores: List[Tuple[torch.Tensor, torch.Tensor]] = []
-            while sum(int(points.shape[0]) for _, points in best_scores) < fallback_need:
-                n_batch = min(batch_size, max(batch_size, 2 * fallback_need))
-                x = sample_uniform_bounds(bounds, n_batch, device=device).detach()
-                x.requires_grad_(True)
-                opt = torch.optim.Adam([x], lr=float(lr))
-                for _ in range(int(steps)):
-                    opt.zero_grad()
-                    values = omega.query(x).reshape(-1)
-                    loss = torch.relu(values - float(sublevel)).mean()
-                    loss.backward()
-                    opt.step()
-                    project_to_bounds_(x, bounds)
-                with torch.no_grad():
-                    values = omega.query(x).reshape(-1)
-                    best_scores.append((torch.relu(values - float(sublevel)).detach().cpu(), x.detach().cpu()))
-                    total_initial_points += int(n_batch)
-                if len(best_scores) >= max_batches:
-                    break
-            if best_scores:
-                scores = torch.cat([score for score, _ in best_scores], dim=0)
-                points = torch.cat([points for _, points in best_scores], dim=0)
-                take = min(fallback_need, points.shape[0])
-                idx = torch.argsort(scores)[:take]
-                chunks.append(points[idx].to(device=device))
-                accepted_points += int(take)
-        samples = torch.cat(chunks, dim=0)[:count] if chunks else torch.empty(0, len(bounds), device=device)
-        with torch.no_grad():
-            values = omega.query(samples).reshape(-1) if samples.numel() else torch.empty(0, device=device)
-            inside = int((values <= float(sublevel)).sum().item()) if values.numel() else 0
-            final_min = float(values.min().item()) if values.numel() else None
-            final_mean = float(values.mean().item()) if values.numel() else None
-            final_max = float(values.max().item()) if values.numel() else None
-        stats = {
-            "mode": mode,
-            "requested_points": int(count),
-            "returned_points": int(samples.shape[0]),
-            "sublevel": float(sublevel),
-            "strict_sublevel": bool(strict_sublevel),
-            "inside_sublevel_points": inside,
-            "inside_sublevel_fraction": float(inside / samples.shape[0]) if samples.shape[0] else None,
-            "initial_points_optimized": int(total_initial_points),
-            "attempts": int(attempts),
-            "steps": int(steps),
-            "lr": float(lr),
-            "omega_min": final_min,
-            "omega_mean": final_mean,
-            "omega_max": final_max,
-        }
-        return samples, stats
-
-    scores = torch.cat([score for score, _ in scored_chunks], dim=0)
-    points = torch.cat([points for _, points in scored_chunks], dim=0)
-    take = min(int(count), points.shape[0])
-    idx = torch.argsort(scores)[:take]
-    samples = points[idx].to(device=device)
-    selected_scores = scores[idx]
-    stats = {
-        "mode": mode,
-        "requested_points": int(count),
-        "returned_points": int(samples.shape[0]),
-        "sublevel": float(sublevel),
-        "strict_sublevel": bool(strict_sublevel),
-        "initial_points_optimized": int(total_initial_points),
-        "attempts": int(attempts),
-        "steps": int(steps),
-        "lr": float(lr),
-        "abs_omega_minus_one_min": float(selected_scores.min().item()) if selected_scores.numel() else None,
-        "abs_omega_minus_one_mean": float(selected_scores.mean().item()) if selected_scores.numel() else None,
-        "abs_omega_minus_one_max": float(selected_scores.max().item()) if selected_scores.numel() else None,
-    }
-    return samples, stats
-
-
 def threshold_witness_payload(
     x: torch.Tensor,
     fx: torch.Tensor,
@@ -4763,10 +4526,6 @@ def prepare_value_heatmap_optimal_control_grid_2d(
         points,
         control_grid,
         state_batch_size=max(1, int(system.training.control_grid_batch_size)),
-        label_selection_mode=system.training.policy_label_selection_mode,
-        k_matrix=k_matrix,
-        lqr_near_optimal_rel_tol=system.training.policy_label_lqr_near_optimal_rel_tol,
-        lqr_min_clip_fraction=system.training.policy_label_lqr_min_clip_fraction,
         mask_out_of_domain_successors=bool(system.training.policy_label_mask_out_of_domain_successors),
         successor_domain=tuple(tuple(v) for v in vcfg.domain),
     )
@@ -6601,7 +6360,6 @@ class TrainingPipeline:
         assert self.lqr_box_artifacts is not None
 
         cfg = self.system.training
-        policy_label_selection_mode = normalize_policy_label_selection_mode(cfg.policy_label_selection_mode)
         counts = resolve_data_distribution_counts(self.system)
         artifact_dir = self.artifact_dir()
         artifact_dir.mkdir(parents=True, exist_ok=True)
@@ -6641,10 +6399,10 @@ class TrainingPipeline:
             cached_selection_mode = normalize_policy_label_selection_mode(
                 metadata.get("policy_label_selection_mode", "argmin")
             )
-            if cached_selection_mode != policy_label_selection_mode:
+            if cached_selection_mode != "argmin":
                 raise ValueError(
                     "Policy label cache selection-mode mismatch: "
-                    f"cache has {cached_selection_mode!r}, config wants {policy_label_selection_mode!r}. "
+                    f"cache has {cached_selection_mode!r}, config wants 'argmin'. "
                     "Regenerate labels or point policy_label_cache_path at a matching cache."
                 )
             if bool(cfg.policy_label_use_confidence_weight) and (
@@ -6653,15 +6411,6 @@ class TrainingPipeline:
                 raise ValueError(
                     "Policy label cache is configured for confidence-weighted control loss but does not contain "
                     "control_weight/near_optimal_fraction. Regenerate the cache."
-                )
-            if policy_label_selection_mode == "prefer_clipped_lqr_when_near_optimal" and (
-                "lqr_replacement_mask" not in payload
-                or "lqr_relative_gap" not in payload
-                or "lqr_clip_fraction" not in payload
-            ):
-                raise ValueError(
-                    "Policy label cache is marked for clipped-LQR replacement labels but does not "
-                    "contain LQR replacement diagnostics. Regenerate the cache."
                 )
             print(f"Loading cached PiNet grid-search labels from {cache_path}")
             labels = PolicyLabelBatch(
@@ -6672,9 +6421,6 @@ class TrainingPipeline:
                 near_optimal_fraction=payload.get("near_optimal_fraction", None),
                 feasible_control_fraction=payload.get("feasible_control_fraction", None),
                 unmasked_fallback_mask=payload.get("unmasked_fallback_mask", None),
-                lqr_replacement_mask=payload.get("lqr_replacement_mask", None),
-                lqr_relative_gap=payload.get("lqr_relative_gap", None),
-                lqr_clip_fraction=payload.get("lqr_clip_fraction", None),
                 decisive_mask=payload.get(
                     "decisive_mask",
                     torch.ones_like(payload["omega_opt_next"], dtype=torch.bool),
@@ -6706,23 +6452,6 @@ class TrainingPipeline:
                 labels.unmasked_fallback_mask = torch.zeros(labels.x.shape[0], device=self.device, dtype=torch.bool)
             if not bool(cfg.policy_label_use_confidence_weight):
                 labels.control_weight = torch.ones(labels.x.shape[0], device=self.device, dtype=torch.float32)
-            if labels.lqr_replacement_mask is not None:
-                labels.lqr_replacement_mask = labels.lqr_replacement_mask.to(device=self.device, dtype=torch.bool)
-            if labels.lqr_relative_gap is not None:
-                labels.lqr_relative_gap = labels.lqr_relative_gap.to(device=self.device, dtype=torch.float32)
-            if labels.lqr_clip_fraction is not None:
-                labels.lqr_clip_fraction = labels.lqr_clip_fraction.to(device=self.device, dtype=torch.float32)
-            if labels.lqr_replacement_mask is None:
-                labels.lqr_replacement_mask = torch.zeros(labels.x.shape[0], device=self.device, dtype=torch.bool)
-            if labels.lqr_relative_gap is None:
-                labels.lqr_relative_gap = torch.full(
-                    (labels.x.shape[0],),
-                    float("nan"),
-                    device=self.device,
-                    dtype=torch.float32,
-                )
-            if labels.lqr_clip_fraction is None:
-                labels.lqr_clip_fraction = torch.zeros(labels.x.shape[0], device=self.device, dtype=torch.float32)
             policy_source_ids = payload["source_ids"].detach().cpu().to(dtype=torch.long)
             label_filter_summary = dict(payload.get("label_filter_summary", {}))
             label_filter_summary["loaded_policy_label_cache"] = str(cache_path)
@@ -6847,12 +6576,10 @@ class TrainingPipeline:
             )
             print(f"  control grid points      = {control_grid.shape[0]}")
             print(f"  grid points per dim      = {cfg.control_grid_points}")
-            print(f"  label selection mode     = {policy_label_selection_mode}")
+            print("  label selection mode     = argmin")
             print(f"  confidence weights       = {cfg.policy_label_use_confidence_weight}")
             print(f"  mask OOD successors      = {cfg.policy_label_mask_out_of_domain_successors}")
             print(f"  near-optimal rel tol     = {cfg.policy_label_near_optimal_rel_tol}")
-            print(f"  LQR replacement rel tol  = {cfg.policy_label_lqr_near_optimal_rel_tol}")
-            print(f"  LQR min clip fraction    = {cfg.policy_label_lqr_min_clip_fraction}")
             labels = compute_optimal_next_omega_grid_labels(
                 self.system,
                 omega,
@@ -6862,10 +6589,6 @@ class TrainingPipeline:
                 resolve_ambiguous_for_policy=False,
                 near_optimal_rel_tol=cfg.policy_label_near_optimal_rel_tol,
                 compute_control_confidence=bool(cfg.policy_label_use_confidence_weight),
-                label_selection_mode=policy_label_selection_mode,
-                k_matrix=self.lqr_box_artifacts.K.to(device=self.device, dtype=torch.float32),
-                lqr_near_optimal_rel_tol=cfg.policy_label_lqr_near_optimal_rel_tol,
-                lqr_min_clip_fraction=cfg.policy_label_lqr_min_clip_fraction,
                 mask_out_of_domain_successors=bool(cfg.policy_label_mask_out_of_domain_successors),
                 successor_domain=tuple(tuple(v) for v in self.system.verification.domain),
             )
@@ -6885,32 +6608,15 @@ class TrainingPipeline:
                 labels.neighbor_imputed_mask = torch.zeros(labels.x.shape[0], device=self.device, dtype=torch.bool)
             if labels.midpoint_default_mask is None:
                 labels.midpoint_default_mask = torch.zeros(labels.x.shape[0], device=self.device, dtype=torch.bool)
-            if labels.lqr_replacement_mask is None:
-                labels.lqr_replacement_mask = torch.zeros(labels.x.shape[0], device=self.device, dtype=torch.bool)
-            if labels.lqr_relative_gap is None:
-                labels.lqr_relative_gap = torch.full(
-                    (labels.x.shape[0],),
-                    float("nan"),
-                    device=self.device,
-                    dtype=torch.float32,
-                )
-            if labels.lqr_clip_fraction is None:
-                labels.lqr_clip_fraction = torch.zeros(labels.x.shape[0], device=self.device, dtype=torch.float32)
-            lqr_replaced = labels.lqr_replacement_mask
-            lqr_gap_replaced = labels.lqr_relative_gap[lqr_replaced]
             fallback_mask = labels.unmasked_fallback_mask
             label_filter_summary["control_label_resolution"] = {
-                "mode": policy_label_selection_mode,
+                "mode": "argmin",
                 "successor_domain_mask": bool(cfg.policy_label_mask_out_of_domain_successors),
                 "successor_domain": [
                     [float(lo), float(hi)]
                     for lo, hi in self.system.verification.domain
                 ],
-                "label_target": (
-                    "clipped_lqr_when_all_components_clipped_and_near_optimal_else_exact_grid_argmin"
-                    if policy_label_selection_mode == "prefer_clipped_lqr_when_near_optimal"
-                    else "exact_grid_argmin"
-                ),
+                "label_target": "exact_grid_argmin",
                 "weighted_term": (
                     "control_imitation_mse_only"
                     if cfg.policy_label_use_confidence_weight
@@ -6927,39 +6633,10 @@ class TrainingPipeline:
                     if cfg.policy_label_use_confidence_weight
                     else None
                 ),
-                "lqr_replacement_relative_tolerance": (
-                    float(cfg.policy_label_lqr_near_optimal_rel_tol)
-                    if policy_label_selection_mode == "prefer_clipped_lqr_when_near_optimal"
-                    else None
-                ),
-                "lqr_min_clip_fraction": (
-                    float(cfg.policy_label_lqr_min_clip_fraction)
-                    if policy_label_selection_mode == "prefer_clipped_lqr_when_near_optimal"
-                    else None
-                ),
-                "lqr_clip_rule": (
-                    "all input components must be clipped by at least lqr_min_clip_fraction"
-                    if policy_label_selection_mode == "prefer_clipped_lqr_when_near_optimal"
-                    else None
-                ),
-                "lqr_replacement_points": int(lqr_replaced.sum().item()),
-                "lqr_replacement_fraction": float(lqr_replaced.to(dtype=torch.float32).mean().item()),
                 "feasible_control_fraction_min": float(labels.feasible_control_fraction.min().detach().cpu().item()),
                 "feasible_control_fraction_mean": float(labels.feasible_control_fraction.mean().detach().cpu().item()),
                 "feasible_control_fraction_p05": float(torch.quantile(labels.feasible_control_fraction, 0.05).detach().cpu().item()),
                 "unmasked_fallback_points": int(fallback_mask.sum().item()),
-                "lqr_replacement_relative_gap_mean": (
-                    float(lqr_gap_replaced.mean().detach().cpu().item())
-                    if lqr_gap_replaced.numel()
-                    else None
-                ),
-                "lqr_replacement_relative_gap_max": (
-                    float(lqr_gap_replaced.max().detach().cpu().item())
-                    if lqr_gap_replaced.numel()
-                    else None
-                ),
-                "lqr_clip_fraction_mean": float(labels.lqr_clip_fraction.mean().detach().cpu().item()),
-                "lqr_clip_fraction_p95": float(torch.quantile(labels.lqr_clip_fraction, 0.95).detach().cpu().item()),
                 "control_weight_min": float(labels.control_weight.min().detach().cpu().item()),
                 "control_weight_mean": float(labels.control_weight.mean().detach().cpu().item()),
                 "control_weight_p05": float(torch.quantile(labels.control_weight, 0.05).detach().cpu().item()),
@@ -6977,9 +6654,6 @@ class TrainingPipeline:
                 "near_optimal_fraction": labels.near_optimal_fraction.detach().cpu(),
                 "feasible_control_fraction": labels.feasible_control_fraction.detach().cpu(),
                 "unmasked_fallback_mask": labels.unmasked_fallback_mask.detach().cpu(),
-                "lqr_replacement_mask": labels.lqr_replacement_mask.detach().cpu(),
-                "lqr_relative_gap": labels.lqr_relative_gap.detach().cpu(),
-                "lqr_clip_fraction": labels.lqr_clip_fraction.detach().cpu(),
                 "decisive_mask": labels.decisive_mask.detach().cpu(),
                 "neighbor_imputed_mask": labels.neighbor_imputed_mask.detach().cpu(),
                 "midpoint_default_mask": labels.midpoint_default_mask.detach().cpu(),
@@ -6991,12 +6665,10 @@ class TrainingPipeline:
                     "u_dim": int(self.system.u_dim),
                     "control_grid_points": int(cfg.control_grid_points),
                     "control_grid_total_points": int(control_grid.shape[0]),
-                    "policy_label_selection_mode": policy_label_selection_mode,
+                    "policy_label_selection_mode": "argmin",
                     "policy_label_use_confidence_weight": bool(cfg.policy_label_use_confidence_weight),
                     "policy_label_mask_out_of_domain_successors": bool(cfg.policy_label_mask_out_of_domain_successors),
                     "policy_label_near_optimal_rel_tol": float(cfg.policy_label_near_optimal_rel_tol),
-                    "policy_label_lqr_near_optimal_rel_tol": float(cfg.policy_label_lqr_near_optimal_rel_tol),
-                    "policy_label_lqr_min_clip_fraction": float(cfg.policy_label_lqr_min_clip_fraction),
                     "policy_label_dos_sublevel": float(cfg.policy_label_dos_sublevel),
                     "omega_checkpoint": str(omega_path),
                 },
@@ -7052,12 +6724,6 @@ class TrainingPipeline:
                 labels.feasible_control_fraction = labels.feasible_control_fraction[selected_indices_cpu.to(device=self.device)]
             if labels.unmasked_fallback_mask is not None:
                 labels.unmasked_fallback_mask = labels.unmasked_fallback_mask[selected_indices_cpu.to(device=self.device)]
-            if labels.lqr_replacement_mask is not None:
-                labels.lqr_replacement_mask = labels.lqr_replacement_mask[selected_indices_cpu.to(device=self.device)]
-            if labels.lqr_relative_gap is not None:
-                labels.lqr_relative_gap = labels.lqr_relative_gap[selected_indices_cpu.to(device=self.device)]
-            if labels.lqr_clip_fraction is not None:
-                labels.lqr_clip_fraction = labels.lqr_clip_fraction[selected_indices_cpu.to(device=self.device)]
             if labels.decisive_mask is not None:
                 labels.decisive_mask = labels.decisive_mask[selected_indices_cpu.to(device=self.device)]
             if labels.neighbor_imputed_mask is not None:
@@ -7257,7 +6923,7 @@ class TrainingPipeline:
                 "+ pi_lambda_decrease * ReLU(omega(f(x,pi_nn(x))) - (1-kappa)*omega(x)) "
                 "+ pi_lambda_control * weighted_MSE((pi_nn(x)-u_opt_grid)/(u_hi-u_lb))"
             ),
-            "policy_label_selection_mode": policy_label_selection_mode,
+            "policy_label_selection_mode": "argmin",
             "policy_label_near_optimal_rel_tol": float(cfg.policy_label_near_optimal_rel_tol),
             "control_imitation_weighting": (
                 "control_weight=1-near_optimal_fraction over the full control grid"
@@ -7325,8 +6991,8 @@ class TrainingPipeline:
         # The optimized objective uses two independently sampled datasets:
         #   - trajectory points receive only finite-horizon label MSE;
         #   - constraint points receive the Zubov residual, range guard, and
-        #     DOS-masked squared decrease penalty
-        #     relu(w_next - (1-kappa) * w_x)^2.
+        #     DOS-masked multiplicative decrease hinge
+        #     relu(w_next - (1-kappa) * w_x).
         #
         # This stage is closed-loop and uses singleton successor states; that is
         # a different object from original omega's interval residual.
@@ -7735,7 +7401,7 @@ class TrainingPipeline:
                 "data_target": str(closed_loop_data_target),
                 "anchor_filter": str(cfg.closed_loop_anchor_filter),
                 "finite_trajectory_mse": "legacy name for closed-loop data-target MSE on trajectory points only",
-                "decrease_violation": "squared multiplicative decrease hinge relu(w_next - (1-kappa)*w_x)^2 on constraint points satisfying omega_orig(x)<=dos_gate",
+                "decrease_violation": "multiplicative decrease hinge relu(w_next - (1-kappa)*w_x) on constraint points satisfying omega_orig(x)<=dos_gate",
                 "range_penalty": "outside original-omega DOS gate, penalize (1 - omega_cl(x))^2",
                 "boundary_condition_mse": "origin anchor omega_cl(0)^2",
                 "lambda_zubov": float(cfg.closed_loop_lambda_zubov),

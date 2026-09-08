@@ -129,8 +129,6 @@ class TrainingConfig:
     reachability_expansion_factor: float = 1.25
     reachability_expansion_max_radius_scale: float = 100.0
     policy_label_dos_sublevel: float = 0.98
-    optimized_sampler_steps: int = 0
-    optimized_sampler_lr: float = 5e-2
     optimized_sampler_max_attempts: int = 100
     optimized_sampler_strict_sublevel: bool = False
     closed_loop_optimized_sampler_strict_sublevel: bool = False
@@ -150,12 +148,9 @@ class TrainingConfig:
     pi_plot_points: int = 5_000
     policy_decrease_report_points: int = 200_000
     policy_decrease_report_batch_size: int = 50_000
-    policy_label_selection_mode: str = "argmin"
     policy_label_use_confidence_weight: bool = False
     policy_label_mask_out_of_domain_successors: bool = False
     policy_label_near_optimal_rel_tol: float = 1e-2
-    policy_label_lqr_near_optimal_rel_tol: float = 1e-2
-    policy_label_lqr_min_clip_fraction: float = 1e-3
     diagnostic_plot_grid_points: int = 151
     policy_label_gap_near_optimal_rel_tol: float = 1e-2
     # Diagnostic heatmaps are 2D coordinate slices through the origin. Each pair
@@ -848,12 +843,9 @@ SYSTEMS: Dict[str, SystemSpec] = {
                     pi_lambda_control=1e-4,
                     pi_lambda_decrease=0.0,
                     policy_label_cache_path=None,
-                    policy_label_selection_mode="argmin",
                     policy_label_use_confidence_weight=False,
                     policy_label_mask_out_of_domain_successors=True,
                     policy_label_near_optimal_rel_tol=1e-2,
-                    policy_label_lqr_near_optimal_rel_tol=1e-2,
-                    policy_label_lqr_min_clip_fraction=1e-3,
                     pi_lr=3e-3,
                     optimized_sampler_max_attempts=200,
                     pi_batch_size=8000,

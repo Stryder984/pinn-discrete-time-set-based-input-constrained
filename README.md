@@ -19,6 +19,8 @@ The pipeline stages are:
 6. `plot_threshold_diagnostics`: generate diagnostic plots for the selected thresholds.
 7. `verification.py`: run alpha-beta-CROWN against the exported verification model.
 
+The historical `export` stage is currently reserved for future TorchScript/ONNX packaging work and is not part of the reviewed workflow.
+
 Generated runs are written under `pipeline_runs/`. They are intentionally ignored by Git because they can contain large checkpoints, plots, CSVs, and search artifacts.
 
 ## Important Files
@@ -40,4 +42,3 @@ See `requirements.txt` for the lightweight Python package list. The verifier bac
 ## Notes
 
 This is a cleaned source snapshot. It intentionally excludes historical experiment folders and generated run outputs.
-
