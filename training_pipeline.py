@@ -3163,8 +3163,9 @@ def save_loss_history_artifacts(
 
     epochs = [int(row["epoch"]) for row in history]
     fig, ax = plt.subplots(figsize=(8, 5))
+    skip_plot_keys = {"epoch", "minibatches", "examples_seen", "total"}
     for key in history[0]:
-        if key == "epoch":
+        if key in skip_plot_keys:
             continue
         values = [max(float(row[key]), 1e-16) for row in history]
         ax.semilogy(epochs, values, lw=2, label=key)

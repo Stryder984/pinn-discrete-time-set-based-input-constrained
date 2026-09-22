@@ -355,6 +355,65 @@ def f_sys_cartpole(state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
     )
 
 
+def f_sys_acrobot(state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
+    """Ideal torque-limited Acrobot, forward-Euler discretized.
+
+    State layout is (theta1, theta2, omega1, omega2), centered at the upright
+    equilibrium. The physical first-link angle is pi + theta1, so the origin
+    with zero elbow torque is the unstable upright equilibrium.
+    """
+    dt = 0.002
+    gravity = 9.81
+    m1 = 0.5234602302310271
+    m2 = 0.6255677234174437
+    l1 = 0.2
+    lc1 = 0.2
+    lc2 = 0.25569305436052964
+    i1 = 0.031887199591513114
+    i2 = 0.05086984812807257
+    max_torque = 6.0
+
+    theta1 = state[..., 0:1]
+    theta2 = state[..., 1:2]
+    omega1 = state[..., 2:3]
+    omega2 = state[..., 3:4]
+    torque = torch.clamp(action[..., 0:1], min=-max_torque, max=max_torque)
+
+    cos_theta2 = torch.cos(theta2)
+    sin_theta2 = torch.sin(theta2)
+    coupling = m2 * l1 * lc2
+
+    m11 = i1 + i2 + m2 * l1 * l1 + 2.0 * coupling * cos_theta2
+    m12 = i2 + coupling * cos_theta2
+    m22 = torch.full_like(m11, i2)
+    determinant = m11 * m22 - m12 * m12
+
+    r1 = (
+        m1 * gravity * lc1 * torch.sin(theta1)
+        + m2 * gravity * (l1 * torch.sin(theta1) + lc2 * torch.sin(theta1 + theta2))
+        + 2.0 * coupling * sin_theta2 * omega1 * omega2
+        + coupling * sin_theta2 * omega2 * omega2
+    )
+    r2 = (
+        m2 * gravity * lc2 * torch.sin(theta1 + theta2)
+        - coupling * sin_theta2 * omega1 * omega1
+        + torque
+    )
+
+    omega1_dot = (m22 * r1 - m12 * r2) / determinant
+    omega2_dot = (-m12 * r1 + m11 * r2) / determinant
+
+    return torch.cat(
+        [
+            theta1 + dt * omega1,
+            theta2 + dt * omega2,
+            omega1 + dt * omega1_dot,
+            omega2 + dt * omega2_dot,
+        ],
+        dim=-1,
+    )
+
+
 def f_sys_van_der_pol(state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
     """Controlled Van der Pol oscillator, discretized by forward Euler.
 
@@ -569,30 +628,31 @@ SYSTEMS: Dict[str, SystemSpec] = {
                     pi_hidden_sizes=(64, 64,64,64),
                     omega_label_batch_size=1_000,
                     omega_batch_size=100_000,
-                    omega_full_pass_epochs=True,
-                    omega_epochs=40,
+                    omega_full_pass_epochs=False,
+                    omega_epochs=3000,
                     omega_lambda_data=0.01,
                     kappa=1e-4,
                     omega_lambda_bellman=1.0,
                     omega_lambda_boundary=0.01,
-                    pi_lambda_control=1e-5,
+                    pi_lambda_control=1e-6,
                     pi_batch_size=100_000,
                     pi_lambda_decrease=0.0,
                     pi_full_pass_epochs=True,
-                    pi_epochs=30,
+                    pi_epochs=10,
                     closed_loop_hidden_sizes=(64, 64, 64,64,64),
                     closed_loop_train_batch_size=100_000,
-                    closed_loop_full_pass_epochs=True,
-                    closed_loop_epochs=40,
+                    closed_loop_full_pass_epochs=False,
+                    closed_loop_epochs=3000,
                     closed_loop_lambda_data=0.01,
-                    closed_loop_lambda_zubov=0.0,
+                    closed_loop_lambda_zubov=0.01,
                     closed_loop_data_target="omega_orig",
                     closed_loop_anchor_filter="omega_orig_nonviolating",
                     closed_loop_lambda_decrease=30.0,
                     closed_loop_lambda_range=0.0,
                     closed_loop_lambda_boundary=0.0,
                     plot_pairs =((0,1),(1,2),(0,2)),
-                    threshold_search_c2_scale=0.99,
+                    threshold_search_samples=64_000_000,
+                    threshold_search_c2_scale=0.98,
                     threshold_search_w1_scale=0.99
                 ),
         verification=VerificationConfig(
@@ -616,22 +676,181 @@ SYSTEMS: Dict[str, SystemSpec] = {
         training=TrainingConfig(
                     q_scale=3e-4,
                     r_scale=1e-3,
+                    reachability_expansion_max_radius_scale=2.0,
+                    zubov_alpha_scale=40.0,
+                    data_profile=DataDistributionProfile(
+                        base_points_per_dim=1000,
+                        base_exponent=None,
+                        base_reference_dim=2,
+                        base_dimension_growth=2.0,
+                        global_scale=0.25,
+                        omega_label_total_ratio=5e-2,
+                        omega_label_dimension_scale_base=1.0,
+                        omega_label_ellipse_fraction=0.5,
+                        omega_label_uniform_fraction=0.5,
+                        omega_collocation_total_ratio=0.5,
+                        omega_collocation_ellipse_fraction=0.2,
+                        omega_collocation_uniform_fraction=0.8,
+                        policy_total_ratio=0.25,
+                        policy_dimension_scale_base=1.0,
+                        policy_ellipse_fraction=0.4,
+                        policy_uniform_fraction=0.1,
+                        policy_gd_fraction=0.5,
+                        closed_loop_trajectory_total_ratio=1e-2,
+                        closed_loop_trajectory_dimension_scale_base=1.0,
+                        closed_loop_trajectory_ellipse_fraction=0.2,
+                        closed_loop_trajectory_uniform_fraction=0.2,
+                        closed_loop_trajectory_gd_fraction=0.6,
+                        closed_loop_constraint_total_ratio=0.5,
+                        closed_loop_constraint_ellipse_fraction=0.2,
+                        closed_loop_constraint_uniform_fraction=0.2,
+                        closed_loop_constraint_gd_fraction=0.6,
+                    ),
                     omega_hidden_sizes=(64, 64, 64, 64, 64, 64),
-                    pi_hidden_sizes=(32, 32, 32, 32, 32),
+                    pi_hidden_sizes=(96, 96, 96, 96),
+                    pi_activation="relu",
                     omega_lambda_data=0.01,
                     omega_lambda_bellman=1.0,
                     omega_lambda_boundary=0.01,
-                    pi_lambda_control=1e-6,
+                    omega_batch_size=50_000,
+                    omega_label_batch_size=64,
+                    omega_rollouts_per_state=3000,
+                    omega_full_pass_epochs=False,
+                    omega_epochs=3000,
+                    pi_lambda_control=1e-5,
+                    pi_batch_size=50_000,
+                    pi_full_pass_epochs=True,
+                    pi_epochs=60,
+                    pi_lambda_decrease=10.0,
                     closed_loop_hidden_sizes=(64, 64, 64, 64, 64, 64),
+                    closed_loop_train_batch_size=50_000,
+                    closed_loop_full_pass_epochs=False,
+                    closed_loop_epochs=3000,
+                    closed_loop_lambda_zubov=0.01,
+                    closed_loop_data_target="omega_orig",
+                    closed_loop_anchor_filter="omega_orig_nonviolating",
                     closed_loop_lambda_data=0.01,
-                    closed_loop_lambda_decrease=10.0,
-                    closed_loop_lambda_range=0.01,
+                    closed_loop_lambda_decrease=30.0,
+                    closed_loop_lambda_range=0.0,
+                    closed_loop_lambda_boundary=0.0,
+                    policy_label_mask_out_of_domain_successors=True,
+                    plot_pairs=((0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)),
+                    threshold_search_c2_scale=0.75,
+                    threshold_search_w1_scale=0.50,
                 ),
         verification=VerificationConfig(
-                    domain=((-0.4, 0.4), (-0.4, 0.4), (-0.4, 0.4), (-0.4, 0.4)),
-                    eps=1e-08,
-                ),
+                    domain=((-1.0, 1.0), (-1.0, 1.0), (-1.0, 1.0), (-1.0, 1.0)),
+                    eps=1e-09,
+        ),
         state_labels=('cart_position', 'pole_angle', 'cart_velocity', 'pole_angular_velocity'),
+    ),
+    'acrobot': SystemSpec(
+        name='acrobot',
+        n_dim=4,
+        u_dim=1,
+        # PLACEHOLDER domain: broad enough to include downward-facing first-link
+        # states near theta1=+-pi, but not yet tuned against sampling cost or
+        # verification behavior.
+        x_lb=(-math.pi, -math.pi, -8.0, -8.0),
+        x_hi=(math.pi, math.pi, 8.0, 8.0),
+        u_lb=(-6.0,),
+        u_hi=(6.0,),
+        dt=0.002,
+        dynamics=f_sys_acrobot,
+        local_decrease=LocalDecreaseConfig(
+            # PLACEHOLDER local box and eta_bound: the Acrobot acceleration map
+            # contains M(theta)^-1, so this needs a dedicated analytic or
+            # interval Hessian bound before the local c1 certificate should be
+            # treated as meaningful.
+            box_radii=(0.25, 0.25, 1.0, 1.0),
+            eta_bound=(0.0, 0.0, 0.2, 1.0),
+            epsilon=1e-08,
+            source='PLACEHOLDER: finite Acrobot eta bound for implementation bring-up only; derive before certification claims',
+        ),
+        checkpoints=CheckpointNames(
+            pi='acrobot_pi.pt',
+            omega='acrobot_omega.pt',
+            omega_closed_loop='acrobot_omegaCL.pt',
+            pi_script='acrobot_pi_script.pt',
+            omega_script='acrobot_omega_script.pt',
+            omega_closed_loop_script='acrobot_omegaCL_script.pt',
+            pi_onnx='acrobot_pi.onnx',
+            omega_onnx='acrobot_omega.onnx',
+            omega_closed_loop_onnx='acrobot_omegaCL.onnx',
+        ),
+        training=TrainingConfig(
+                    q_scale=1e-4,
+                    r_scale=1e-3,
+                    reachability_expansion_max_radius_scale=4.0,
+                    zubov_alpha_scale=20.0,
+                    data_profile=DataDistributionProfile(
+                        base_points_per_dim=1000,
+                        base_exponent=None,
+                        base_reference_dim=2,
+                        base_dimension_growth=2.0,
+                        global_scale=0.25,
+                        omega_label_total_ratio=5e-2,
+                        omega_label_dimension_scale_base=1.0,
+                        omega_label_ellipse_fraction=0.5,
+                        omega_label_uniform_fraction=0.5,
+                        omega_collocation_total_ratio=0.5,
+                        omega_collocation_ellipse_fraction=0.2,
+                        omega_collocation_uniform_fraction=0.8,
+                        policy_total_ratio=0.25,
+                        policy_dimension_scale_base=1.0,
+                        policy_ellipse_fraction=0.4,
+                        policy_uniform_fraction=0.1,
+                        policy_gd_fraction=0.5,
+                        closed_loop_trajectory_total_ratio=1e-2,
+                        closed_loop_trajectory_dimension_scale_base=1.0,
+                        closed_loop_trajectory_ellipse_fraction=0.2,
+                        closed_loop_trajectory_uniform_fraction=0.2,
+                        closed_loop_trajectory_gd_fraction=0.6,
+                        closed_loop_constraint_total_ratio=0.5,
+                        closed_loop_constraint_ellipse_fraction=0.2,
+                        closed_loop_constraint_uniform_fraction=0.2,
+                        closed_loop_constraint_gd_fraction=0.6,
+                    ),
+                    omega_hidden_sizes=(64, 64, 64, 64, 64, 64),
+                    pi_hidden_sizes=(96, 96, 96, 96),
+                    pi_activation="relu",
+                    omega_lambda_data=0.01,
+                    omega_lambda_bellman=1.0,
+                    omega_lambda_boundary=0.01,
+                    omega_batch_size=50_000,
+                    omega_label_batch_size=64,
+                    omega_rollouts_per_state=3000,
+                    omega_full_pass_epochs=False,
+                    omega_epochs=3000,
+                    pi_lambda_control=1e-5,
+                    pi_batch_size=50_000,
+                    pi_full_pass_epochs=True,
+                    pi_epochs=60,
+                    pi_lambda_decrease=10.0,
+                    closed_loop_hidden_sizes=(64, 64, 64, 64, 64, 64),
+                    closed_loop_train_batch_size=50_000,
+                    closed_loop_full_pass_epochs=False,
+                    closed_loop_epochs=3000,
+                    closed_loop_lambda_zubov=0.01,
+                    closed_loop_data_target="omega_orig",
+                    closed_loop_anchor_filter="omega_orig_nonviolating",
+                    closed_loop_lambda_data=0.01,
+                    closed_loop_lambda_decrease=30.0,
+                    closed_loop_lambda_range=0.0,
+                    closed_loop_lambda_boundary=0.0,
+                    policy_label_mask_out_of_domain_successors=True,
+                    plot_pairs=((0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)),
+                    threshold_search_c2_scale=0.75,
+                    threshold_search_w1_scale=0.50,
+                ),
+        verification=VerificationConfig(
+                    # PLACEHOLDER verification domain: start near the upright
+                    # equilibrium until the Acrobot eta/local-domain constants
+                    # are derived and the larger DOS experiments are designed.
+                    domain=((-0.8, 0.8), (-0.8, 0.8), (-2.0, 2.0), (-2.0, 2.0)),
+                    eps=1e-09,
+                ),
+        state_labels=('theta1', 'theta2', 'omega1', 'omega2'),
     ),
     'van_der_pol': SystemSpec(
         name='van_der_pol',
@@ -654,7 +873,7 @@ SYSTEMS: Dict[str, SystemSpec] = {
                         base_reference_dim=2,
                         base_dimension_growth=2.0,
                         global_scale=1.0,
-                        omega_label_total_ratio=1e-3,
+                        omega_label_total_ratio=1e-2,
                         omega_label_dimension_scale_base=1.0,
                         omega_label_ellipse_fraction=0.2,
                         omega_label_uniform_fraction=0.8,
@@ -682,8 +901,8 @@ SYSTEMS: Dict[str, SystemSpec] = {
                     omega_batch_size=50_000,
                     omega_rollout_horizon=75,
                     closed_loop_horizon=75,
-                    omega_full_pass_epochs=True,
-                    omega_epochs=50,
+                    omega_full_pass_epochs=False,
+                    omega_epochs=3000,
                     omega_lambda_data=0.01,
                     omega_lambda_bellman=1.0,
                     omega_lambda_boundary=0.01,
@@ -693,9 +912,9 @@ SYSTEMS: Dict[str, SystemSpec] = {
                     pi_lambda_decrease=0.0,
                     closed_loop_hidden_sizes=(20,20,20,20,20,20,20),
                     closed_loop_train_batch_size=50_000,
-                    closed_loop_full_pass_epochs=True,
-                    closed_loop_epochs=50,
-                    closed_loop_lambda_zubov=0.0,
+                    closed_loop_full_pass_epochs=False,
+                    closed_loop_epochs=3000,
+                    closed_loop_lambda_zubov=0.01,
                     closed_loop_data_target="omega_orig",
                     closed_loop_anchor_filter="omega_orig_nonviolating",
                     closed_loop_lambda_data=0.01,
@@ -818,11 +1037,11 @@ SYSTEMS: Dict[str, SystemSpec] = {
                                             omega_collocation_total_ratio=1.0,
                                             omega_collocation_ellipse_fraction=0.2,
                                             omega_collocation_uniform_fraction=0.8,
-                                            policy_total_ratio=0.01,
+                                            policy_total_ratio=0.05,
                                             policy_dimension_scale_base=1.0,
-                                            policy_ellipse_fraction=0.2,
-                                            policy_uniform_fraction=0.1,
-                                            policy_gd_fraction=0.70,
+                                            policy_ellipse_fraction=0.7,
+                                            policy_uniform_fraction=0.0,
+                                            policy_gd_fraction=0.30,
                                             closed_loop_trajectory_total_ratio=1e-2,
                                             closed_loop_trajectory_dimension_scale_base=1.0,
                                             closed_loop_trajectory_ellipse_fraction=0.05,
@@ -834,43 +1053,43 @@ SYSTEMS: Dict[str, SystemSpec] = {
                                             closed_loop_constraint_gd_fraction=0.9,
                                         ),
                     omega_hidden_sizes=(64,64,64,64,64,64,64,64),
-                    omega_full_pass_epochs=True,
-                    omega_epochs=12,
-                    pi_hidden_sizes=(256,256,256,256,256,256,256,256,256,256),
+                    omega_full_pass_epochs=False,
+                    omega_epochs=3000,
+                    pi_hidden_sizes=(512,512,512,512,512,512),
                     pi_activation="relu",
                     omega_lambda_data=0.01,
                     omega_boundary_noise_std=1.0,
-                    pi_lambda_control=1e-4,
+                    pi_lambda_control=1e-2,
                     pi_lambda_decrease=0.0,
                     policy_label_cache_path=None,
                     policy_label_use_confidence_weight=False,
                     policy_label_mask_out_of_domain_successors=True,
                     policy_label_near_optimal_rel_tol=1e-2,
-                    pi_lr=3e-3,
+                    pi_lr=1e-3,
                     optimized_sampler_max_attempts=200,
                     pi_batch_size=8000,
                     pi_train_max_points=None,
                     pi_full_pass_epochs=True,
-                    pi_epochs=12,
+                    pi_epochs=30,
                     pi_log_every=1,
                     policy_decrease_report_points=200_000,
                     closed_loop_hidden_sizes=(64,64,64,64,64,64,64,64),
                     closed_loop_train_batch_size=100_000,
-                    closed_loop_full_pass_epochs=True,
-                    closed_loop_epochs=12,
+                    closed_loop_full_pass_epochs=False,
+                    closed_loop_epochs=3000,
                     closed_loop_lr=3e-4,
-                    closed_loop_lambda_zubov=0.0,
-                    closed_loop_data_target="trajectory",
-                    closed_loop_anchor_filter="none",
+                    closed_loop_lambda_zubov=0.01,
+                    closed_loop_data_target="omega_orig",
+                    closed_loop_anchor_filter="omega_orig_nonviolating",
                     closed_loop_lambda_data=0.1,
                     closed_loop_lambda_range=0.0,
                     closed_loop_lambda_decrease=30.0,
-                    closed_loop_lambda_boundary=0.0001,
+                    closed_loop_lambda_boundary=0.0,
                     control_grid_points = 20,
                     plot_pairs=((0,1),(0,2),(1,4),(2,5)),
-                    closed_loop_dos_sublevel=0.95,
-                    closed_loop_loss_dos_gate=0.95,
-                    policy_label_dos_sublevel=0.95,
+                    closed_loop_dos_sublevel=0.9,
+                    closed_loop_loss_dos_gate=0.9,
+                    policy_label_dos_sublevel=0.9,
                     boundary_diagnostic_w_threshold=0.99,
                     threshold_search_samples=1_000_000
                 ),

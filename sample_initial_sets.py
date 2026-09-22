@@ -104,6 +104,118 @@ def uniform_samples(domain: np.ndarray, n_samples: int, seed: int) -> np.ndarray
     return rng.uniform(lows, highs, size=(n_samples, domain.shape[0])).astype(np.float32)
 
 
+@torch.no_grad()
+def omega_sublevel_rejection_samples(
+    omega: torch.nn.Module,
+    domain: np.ndarray,
+    n_inside: int,
+    seed: int,
+    *,
+    sublevel: float,
+    device: torch.device,
+    batch_size: int,
+    max_candidates: int,
+    strict: bool,
+) -> tuple[np.ndarray, dict[str, object]]:
+    """Uniform rejection sample with matched outside-sublevel controls.
+
+    `n_inside` is the target number of points satisfying omega(x) <= sublevel.
+    The sampler also keeps `n_inside` points with omega(x) > sublevel from the
+    rejected candidates, so downstream plots compare balanced classes while the
+    inside class remains conditionally uniform over the proposed DOS.
+    """
+    if batch_size <= 0:
+        raise ValueError("--rejection-batch-size must be positive.")
+    if max_candidates <= 0:
+        raise ValueError("--rejection-max-candidates must be positive.")
+
+    rng = np.random.default_rng(seed)
+    lows = domain[:, 0]
+    highs = domain[:, 1]
+    inside_chunks: list[np.ndarray] = []
+    outside_chunks: list[np.ndarray] = []
+    inside_value_chunks: list[np.ndarray] = []
+    outside_value_chunks: list[np.ndarray] = []
+    candidates_seen = 0
+
+    while candidates_seen < max_candidates:
+        inside_count = sum(chunk.shape[0] for chunk in inside_chunks)
+        outside_count = sum(chunk.shape[0] for chunk in outside_chunks)
+        if inside_count >= n_inside and outside_count >= n_inside:
+            break
+
+        remaining_budget = max_candidates - candidates_seen
+        current_batch = min(batch_size, remaining_budget)
+        x_np = rng.uniform(lows, highs, size=(current_batch, domain.shape[0])).astype(np.float32)
+        x = torch.as_tensor(x_np, device=device, dtype=torch.float32)
+        values = omega.query(x).reshape(-1).detach().cpu().numpy().astype(np.float32)
+        inside = values <= float(sublevel)
+        candidates_seen += current_batch
+
+        if inside.any() and inside_count < n_inside:
+            needed = n_inside - inside_count
+            accepted_points = x_np[inside][:needed]
+            accepted_values = values[inside][:needed]
+            inside_chunks.append(accepted_points)
+            inside_value_chunks.append(accepted_values)
+        if (~inside).any() and outside_count < n_inside:
+            needed = n_inside - outside_count
+            rejected_points = x_np[~inside][:needed]
+            rejected_values = values[~inside][:needed]
+            outside_chunks.append(rejected_points)
+            outside_value_chunks.append(rejected_values)
+
+    inside_points = (
+        np.concatenate(inside_chunks, axis=0)[:n_inside]
+        if inside_chunks
+        else np.empty((0, domain.shape[0]), dtype=np.float32)
+    )
+    outside_points = (
+        np.concatenate(outside_chunks, axis=0)[:n_inside]
+        if outside_chunks
+        else np.empty((0, domain.shape[0]), dtype=np.float32)
+    )
+    inside_values = (
+        np.concatenate(inside_value_chunks, axis=0)[:n_inside]
+        if inside_value_chunks
+        else np.empty((0,), dtype=np.float32)
+    )
+    outside_values = (
+        np.concatenate(outside_value_chunks, axis=0)[:n_inside]
+        if outside_value_chunks
+        else np.empty((0,), dtype=np.float32)
+    )
+
+    if strict and (inside_points.shape[0] < n_inside or outside_points.shape[0] < n_inside):
+        raise RuntimeError(
+            "Unable to rejection-sample the requested balanced classes: "
+            f"inside={inside_points.shape[0]}, outside={outside_points.shape[0]}, "
+            f"target_each={n_inside}, candidates_seen={candidates_seen}."
+        )
+    points = np.concatenate([inside_points, outside_points], axis=0).astype(np.float32)
+    stats = {
+        "mode": "omega-sublevel-rejection",
+        "sublevel": float(sublevel),
+        "requested_inside_points": int(n_inside),
+        "requested_outside_points": int(n_inside),
+        "returned_inside_points": int(inside_points.shape[0]),
+        "returned_outside_points": int(outside_points.shape[0]),
+        "returned_points": int(points.shape[0]),
+        "candidates_seen": int(candidates_seen),
+        "max_candidates": int(max_candidates),
+        "batch_size": int(batch_size),
+        "strict": bool(strict),
+        "inside_acceptance_rate": float(inside_points.shape[0] / max(candidates_seen, 1)),
+        "inside_omega_min": None if inside_values.size == 0 else float(inside_values.min()),
+        "inside_omega_mean": None if inside_values.size == 0 else float(inside_values.mean()),
+        "inside_omega_max": None if inside_values.size == 0 else float(inside_values.max()),
+        "outside_omega_min": None if outside_values.size == 0 else float(outside_values.min()),
+        "outside_omega_mean": None if outside_values.size == 0 else float(outside_values.mean()),
+        "outside_omega_max": None if outside_values.size == 0 else float(outside_values.max()),
+    }
+    return points, stats
+
+
 def slice_uniform_samples(
     domain: np.ndarray,
     n_samples: int,
@@ -143,10 +255,32 @@ def slice_uniform_samples(
     }
 
 
-def controller_output(pi: torch.nn.Module, x: torch.Tensor) -> torch.Tensor:
-    if hasattr(pi, "nn_control"):
-        return pi.nn_control(x)
-    return pi(x)
+def nu_value(pi: torch.nn.Module, x: torch.Tensor) -> torch.Tensor:
+    p_matrix = pi.P_matrix.to(device=x.device, dtype=x.dtype)
+    return (x @ p_matrix * x).sum(dim=-1, keepdim=True)
+
+
+def controller_output(
+    pi: torch.nn.Module,
+    x: torch.Tensor,
+    *,
+    mode: str,
+    c2: Optional[float],
+) -> torch.Tensor:
+    if mode == "nn":
+        if hasattr(pi, "nn_control"):
+            return pi.nn_control(x)
+        return pi(x)
+    if mode == "stitched":
+        if c2 is None:
+            raise ValueError("stitched controller mode requires a c2 threshold.")
+        if not hasattr(pi, "lqr_control") or not hasattr(pi, "nn_control"):
+            raise ValueError("stitched controller mode requires PiNet lqr_control and nn_control methods.")
+        u_lqr = pi.lqr_control(x)
+        u_nn = pi.nn_control(x)
+        use_lqr = nu_value(pi, x) <= float(c2)
+        return torch.where(use_lqr, u_lqr, u_nn)
+    raise ValueError(f"Unknown controller mode: {mode}")
 
 
 def _project_to_domain_(x: torch.Tensor, domain: torch.Tensor) -> None:
@@ -312,6 +446,8 @@ def convergence_mask(
     points: np.ndarray,
     steps: int,
     norm2_tol: float,
+    controller_mode: str,
+    c2: Optional[float],
     device: torch.device,
     batch_size: int,
 ) -> np.ndarray:
@@ -320,7 +456,7 @@ def convergence_mask(
         stop = min(start + batch_size, points.shape[0])
         x = torch.as_tensor(points[start:stop], device=device, dtype=torch.float32)
         for _ in range(steps):
-            x = system.dynamics(x, controller_output(pi, x))
+            x = system.dynamics(x, controller_output(pi, x, mode=controller_mode, c2=c2))
         final_norm2 = (x * x).sum(dim=-1).detach().cpu().numpy()
         converged[start:stop] = final_norm2 <= float(norm2_tol)
     return converged
@@ -560,6 +696,8 @@ def add_learned_control_inputs(
     system: SystemSpec,
     pi: torch.nn.Module,
     values: dict[str, np.ndarray],
+    controller_mode: str,
+    c2: Optional[float],
     device: torch.device,
 ) -> dict[str, np.ndarray]:
     states = values["states"]
@@ -574,7 +712,13 @@ def add_learned_control_inputs(
         return enriched
 
     x = torch.as_tensor(states[:, :-1, :].reshape(-1, system.n_dim), device=device, dtype=torch.float32)
-    u = controller_output(pi, x).reshape(states.shape[0], steps, system.u_dim).detach().cpu().numpy()
+    u = (
+        controller_output(pi, x, mode=controller_mode, c2=c2)
+        .reshape(states.shape[0], steps, system.u_dim)
+        .detach()
+        .cpu()
+        .numpy()
+    )
     enriched = dict(values)
     enriched["controls"] = u
     return enriched
@@ -586,6 +730,8 @@ def trajectory_values_for_plot(
     models: dict[str, torch.nn.Module],
     points: np.ndarray,
     steps: int,
+    controller_mode: str,
+    c2: Optional[float],
     device: torch.device,
 ) -> dict[str, np.ndarray]:
     if points.shape[0] == 0:
@@ -617,7 +763,7 @@ def trajectory_values_for_plot(
         nu_values[:, t] = (state @ p_matrix * state).sum(dim=-1)
         norm2_values[:, t] = (state * state).sum(dim=-1)
         if t < steps:
-            control = controller_output(pi, state)
+            control = controller_output(pi, state, mode=controller_mode, c2=c2)
             controls[:, t, :] = control
             state = system.dynamics(state, control)
 
@@ -725,7 +871,7 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
     parser.add_argument("--batch-size", type=int, default=4096, help="Batch size for classification and convergence simulation.")
     parser.add_argument(
         "--sampling-mode",
-        choices=("uniform", "omega-sublevel-gd"),
+        choices=("uniform", "omega-sublevel-gd", "omega-sublevel-rejection"),
         default="uniform",
         help="How to generate initial points before omega_cl<w2 classification.",
     )
@@ -755,8 +901,31 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
         action="store_true",
         help="Fail if omega-sublevel-gd cannot return all samples below the requested sublevel.",
     )
+    parser.add_argument(
+        "--rejection-batch-size",
+        type=int,
+        default=None,
+        help="Candidate batch size for omega-sublevel-rejection. Defaults to --batch-size.",
+    )
+    parser.add_argument(
+        "--rejection-max-candidates",
+        type=int,
+        default=5_000_000,
+        help="Maximum uniform candidates evaluated by omega-sublevel-rejection.",
+    )
+    parser.add_argument(
+        "--rejection-strict",
+        action="store_true",
+        help="Fail if omega-sublevel-rejection cannot return --samples inside and --samples outside points.",
+    )
     parser.add_argument("--max-plot-trajectories", type=int, default=200, help="Maximum trajectories plotted per class; use 0 for all.")
     parser.add_argument("--device", default="auto", help="Torch device: auto, cpu, cuda, cuda:0, etc.")
+    parser.add_argument(
+        "--controller-mode",
+        choices=("stitched", "nn"),
+        default="stitched",
+        help="Controller used for the main rollout: stitched uses clamped LQR for nu<=c2 and saturated NN otherwise.",
+    )
     parser.add_argument("--include-grid-optimal", action="store_true", help="Also simulate the training grid-search argmin controller.")
     parser.add_argument("--control-grid-points", type=int, default=None, help="Override grid points per input dimension for grid-optimal rollouts.")
     parser.add_argument("--control-chunk-size", type=int, default=50_000, help="Control-grid chunk size for grid-optimal argmin evaluation.")
@@ -795,6 +964,10 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
         raise ValueError("--initial-convergence-samples must be positive.")
     if args.gd_batch_size is not None and args.gd_batch_size <= 0:
         raise ValueError("--gd-batch-size must be positive.")
+    if args.rejection_batch_size is not None and args.rejection_batch_size <= 0:
+        raise ValueError("--rejection-batch-size must be positive.")
+    if args.rejection_max_candidates <= 0:
+        raise ValueError("--rejection-max-candidates must be positive.")
 
     system = get_system(args.system)
     run_dir = resolve_run_dir(system, run_name=args.run_name, run_dir=args.run_dir)
@@ -802,6 +975,7 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
     artifact_dir = require_artifacts(system, run_dir)
     thresholds = load_thresholds(run_dir)
     w2 = float(thresholds["w2"])
+    c2 = float(thresholds["c2"])
     domain = verification_domain(system, run_dir)
     training_config = run_training_config(run_dir)
     device = pick_device(args.device)
@@ -809,7 +983,7 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
     models = load_models(system, artifact_dir, device=device)
     requested_omega_key = "omega_closed_loop" if args.sampling_omega == "closed-loop" else "omega"
     requested_omega_name = "omega_cl" if requested_omega_key == "omega_closed_loop" else "omega_orig"
-    if args.sampling_mode == "omega-sublevel-gd" or args.sublevel_value is not None:
+    if args.sampling_mode in {"omega-sublevel-gd", "omega-sublevel-rejection"} or args.sublevel_value is not None:
         classification_omega_key = requested_omega_key
         classification_omega_name = requested_omega_name
         classification_sublevel = w2 if args.sublevel_value is None else float(args.sublevel_value)
@@ -828,7 +1002,7 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
             "returned_points": int(points.shape[0]),
             "seed": int(args.seed),
         }
-    else:
+    elif args.sampling_mode == "omega-sublevel-gd":
         points, sampling_stats = omega_sublevel_gd_samples(
             models[requested_omega_key],
             domain,
@@ -841,6 +1015,21 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
             lr=args.gd_lr,
             max_attempts=args.gd_max_attempts,
             strict_sublevel=args.gd_strict_sublevel,
+        )
+        sampling_stats["omega_source"] = requested_omega_key
+        sampling_stats["omega_name"] = requested_omega_name
+        sampling_stats["seed"] = int(args.seed)
+    else:
+        points, sampling_stats = omega_sublevel_rejection_samples(
+            models[requested_omega_key],
+            domain,
+            args.samples,
+            args.seed,
+            sublevel=classification_sublevel,
+            device=device,
+            batch_size=args.rejection_batch_size or args.batch_size,
+            max_candidates=args.rejection_max_candidates,
+            strict=args.rejection_strict,
         )
         sampling_stats["omega_source"] = requested_omega_key
         sampling_stats["omega_name"] = requested_omega_name
@@ -861,6 +1050,8 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
         points=inside_points,
         steps=args.steps,
         norm2_tol=args.convergence_norm2_tol,
+        controller_mode=args.controller_mode,
+        c2=c2,
         device=device,
         batch_size=args.batch_size,
     )
@@ -870,6 +1061,8 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
         points=outside_points,
         steps=args.steps,
         norm2_tol=args.convergence_norm2_tol,
+        controller_mode=args.controller_mode,
+        c2=c2,
         device=device,
         batch_size=args.batch_size,
     )
@@ -925,6 +1118,7 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
         "artifact_dir": str(artifact_dir),
         "thresholds_file": str(run_dir / "verification_thresholds_rescaled.json"),
         "w2": w2,
+        "c2": c2,
         "verification_domain": domain.tolist(),
         "sampling": sampling_stats,
         "classification": {
@@ -947,7 +1141,12 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
         "learned_controller": {
             "n_classification_sublevel_initial_conditions_convergent": int(inside_converged.sum()),
             "n_initial_points_outside_sublevel_convergent": int(outside_converged.sum()),
-            "controller_branch": "saturated_nn",
+            "controller_mode": args.controller_mode,
+            "controller_branch": (
+                "clamped_lqr_inside_nu_c2_else_saturated_nn"
+                if args.controller_mode == "stitched"
+                else "saturated_nn"
+            ),
         },
     }
     if classification_omega_key == "omega_closed_loop" and abs(float(classification_sublevel) - w2) <= 1e-12:
@@ -955,8 +1154,10 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
         stats["n_sublevel_contained_initial_conditions_convergent"] = int(inside_converged.sum())
     if args.sampling_mode == "uniform":
         stats["n_verification_domain_uniform_samples"] = int(points.shape[0])
-    else:
+    elif args.sampling_mode == "omega-sublevel-gd":
         stats["n_verification_domain_gd_sublevel_samples"] = int(points.shape[0])
+    else:
+        stats["n_verification_domain_rejection_sublevel_samples"] = int(points.shape[0])
     if grid_stats is not None:
         stats["grid_optimal_controller"] = grid_stats
 
@@ -989,6 +1190,8 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
         models=models,
         points=inside_plot_points,
         steps=args.steps,
+        controller_mode=args.controller_mode,
+        c2=c2,
         device=device,
     )
     values_outside = trajectory_values_for_plot(
@@ -996,6 +1199,8 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
         models=models,
         points=outside_plot_points,
         steps=args.steps,
+        controller_mode=args.controller_mode,
+        c2=c2,
         device=device,
     )
     plot_side_by_side(
@@ -1048,6 +1253,8 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
             points=slice_points,
             steps=args.steps,
             norm2_tol=args.convergence_norm2_tol,
+            controller_mode=args.controller_mode,
+            c2=c2,
             device=device,
             batch_size=args.batch_size,
         )
