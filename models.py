@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 from pathlib import Path
 from typing import Dict, Iterable, List, Mapping, Optional, Tuple
@@ -109,7 +110,6 @@ class PiNet(nn.Module):
         activation: str = "tanh",
         c_nn_off: Optional[float] = None,
         c_s: Optional[float] = None,
-        c_sigmoid_center: Optional[float] = None,
         sharpness: Optional[float] = None,
         gate_type: Optional[str] = None,
     ):
@@ -141,18 +141,10 @@ class PiNet(nn.Module):
         self.register_buffer("u_hi", _as_float_tensor(u_hi, shape=(self.u_dim,)))
         c_s = float(c_s if c_s is not None else 0.0)
         c_nn_off = float(c_nn_off if c_nn_off is not None else c_s)
-        c_sigmoid_center = float(c_sigmoid_center if c_sigmoid_center is not None else c_s)
         sharpness = float(sharpness if sharpness is not None else 0.0)
         self.use_branch_only = True
         self.register_buffer("c_nn_off_tensor", torch.tensor(c_nn_off, dtype=torch.float32))
         self.register_buffer("c_s_tensor", torch.tensor(c_s, dtype=torch.float32))
-        self.register_buffer(
-            "c_sigmoid_center_tensor",
-            torch.tensor(
-                float(c_sigmoid_center) if c_sigmoid_center is not None else 0.0,
-                dtype=torch.float32,
-            ),
-        )
         self.register_buffer(
             "sharpness_tensor",
             torch.tensor(float(sharpness) if sharpness is not None else 0.0, dtype=torch.float32),
@@ -175,6 +167,20 @@ class PiNet(nn.Module):
         u_hi = self.u_hi.to(device=x.device, dtype=x.dtype)
         return torch.clamp(-(x @ k_matrix.T), min=u_lb, max=u_hi)
 
+    def blended_control(self, x: torch.Tensor, *, c1: float) -> torch.Tensor:
+        """Blend bounded branches with half NN weight at x^T P x = c1.
+
+        Requires positive-definite P. This explicit training controller does
+        not change forward() or the branches used by hard-switch verification.
+        """
+        c1 = float(c1)
+        if not math.isfinite(c1) or c1 <= 0.0:
+            raise ValueError(f"Blend midpoint c1 must be finite and positive, got {c1}.")
+        p_matrix = self.P_matrix.to(device=x.device, dtype=x.dtype)
+        nu = (x @ p_matrix * x).sum(dim=-1, keepdim=True)
+        nn_weight = torch.tanh(math.atanh(0.5) * (nu / c1))
+        return (1.0 - nn_weight) * self.lqr_control(x) + nn_weight * self.nn_control(x)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.nn_control(x)
 
@@ -194,7 +200,6 @@ def load_pinet(checkpoint_path: os.PathLike | str, device: str | torch.device = 
         activation=str(checkpoint.get("activation", checkpoint.get("pi_activation", "tanh"))),
         c_nn_off=checkpoint.get("c_nn_off", checkpoint.get("C_NN_OFF")),
         c_s=checkpoint.get("c_s", checkpoint.get("C_S")),
-        c_sigmoid_center=checkpoint.get("c_sigmoid_center", checkpoint.get("c1_eff")),
         sharpness=checkpoint.get("sharpness"),
         gate_type="branch_only",
     )
@@ -202,6 +207,8 @@ def load_pinet(checkpoint_path: os.PathLike | str, device: str | torch.device = 
     state_dict.pop("u_lb", None)
     state_dict.pop("u_hi", None)
     state_dict.pop("c1_eff_tensor", None)
+    # Historical midpoint buffers never affected the branch-only controller.
+    state_dict.pop("c_sigmoid_center_tensor", None)
     state_dict.pop("sharpness_tensor", None)
     state_dict.pop("legacy_c1_eff_tensor", None)
     state_dict.pop("legacy_sharpness_tensor", None)
@@ -213,7 +220,6 @@ def load_pinet(checkpoint_path: os.PathLike | str, device: str | torch.device = 
         "u_hi",
         "c_nn_off_tensor",
         "c_s_tensor",
-        "c_sigmoid_center_tensor",
         "sharpness_tensor",
     }
     if unexpected or set(missing) - allowed_missing:

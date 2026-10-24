@@ -4,7 +4,7 @@ import argparse
 import json
 import math
 import os
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, fields, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -72,7 +72,7 @@ class LQRBoxArtifacts:
     nonlinear_decrease_constants: Dict[str, object]
     c_analytic: float
     c_s: float
-    c_sigmoid_center: float
+    C_sample_cap: float
     domain_box: Tuple[Tuple[float, float], ...]
     sublevels: Tuple[SublevelRecord, ...]
     notes: Tuple[str, ...] = ()
@@ -914,6 +914,11 @@ def compute_optimal_next_omega_grid_labels(
     The grid is exhaustive over the chosen discretization, not over the
     continuous input set. Increasing `points_per_dim` improves resolution but
     costs `points_per_dim ** u_dim`.
+
+    With successor masking, only contained successors compete. If no grid
+    control is feasible, return value 1 and the grid control nearest the input
+    midpoint as a placeholder, not a feasible control. Such rows have
+    feasible_control_fraction == 0; no unmasked fallback is performed.
     """
     if x.shape[-1] != system.n_dim:
         raise ValueError("x last dimension must equal system.n_dim.")
@@ -933,6 +938,8 @@ def compute_optimal_next_omega_grid_labels(
     device = x.device
     dtype = x.dtype
     control_grid = control_grid.to(device=device, dtype=dtype)
+    if control_grid.shape[0] == 0:
+        raise ValueError("control_grid must not be empty.")
     u_opt_chunks = []
     value_chunks = []
     control_weight_chunks = []
@@ -947,6 +954,7 @@ def compute_optimal_next_omega_grid_labels(
     )
     u_lb = torch.tensor(system.u_lb, device=device, dtype=dtype)
     u_hi = torch.tensor(system.u_hi, device=device, dtype=dtype)
+    placeholder_control = control_grid[((control_grid - midpoint) ** 2).sum(dim=1).argmin()]
     need_landscape = bool(compute_control_confidence)
 
     for start in range(0, x.shape[0], state_batch_size):
@@ -956,8 +964,6 @@ def compute_optimal_next_omega_grid_labels(
         best_controls = torch.empty(bsz, system.u_dim, device=device, dtype=dtype)
         worst_values = torch.full((bsz,), -torch.inf, device=device, dtype=dtype)
         feasible_counts = torch.zeros((bsz,), device=device, dtype=dtype)
-        fallback_best_values = torch.full((bsz,), torch.inf, device=device, dtype=dtype)
-        fallback_best_controls = torch.empty(bsz, system.u_dim, device=device, dtype=dtype)
         stored_value_chunks = []
         stored_control_starts = []
 
@@ -968,17 +974,11 @@ def compute_optimal_next_omega_grid_labels(
             u_expanded = ug.unsqueeze(0).expand(bsz, -1, -1).reshape(bsz * k, system.u_dim)
             next_x = system.dynamics(x_expanded, u_expanded)
             values = omega.query(next_x).reshape(bsz, k)
-            raw_values = values
             if mask_out_of_domain_successors:
                 assert successor_domain is not None
                 feasible = points_in_bounds(next_x, successor_domain).reshape(bsz, k)
                 feasible_counts = feasible_counts + feasible.to(dtype=dtype).sum(dim=1)
                 values = torch.where(feasible, values, torch.full_like(values, torch.inf))
-                raw_chunk_values, raw_chunk_indices = raw_values.min(dim=1)
-                raw_improved = raw_chunk_values < fallback_best_values
-                if raw_improved.any():
-                    fallback_best_values[raw_improved] = raw_chunk_values[raw_improved]
-                    fallback_best_controls[raw_improved] = ug[raw_chunk_indices[raw_improved]]
             chunk_values, chunk_indices = values.min(dim=1)
             improved = chunk_values < best_values
             if improved.any():
@@ -992,11 +992,13 @@ def compute_optimal_next_omega_grid_labels(
                 stored_control_starts.append(int(u_start))
 
         fallback_mask = torch.zeros((bsz,), device=device, dtype=torch.bool)
+        no_feasible_control = torch.zeros_like(fallback_mask)
         if mask_out_of_domain_successors:
-            fallback_mask = ~torch.isfinite(best_values)
-            if fallback_mask.any():
-                best_values[fallback_mask] = fallback_best_values[fallback_mask]
-                best_controls[fallback_mask] = fallback_best_controls[fallback_mask]
+            no_feasible_control = feasible_counts == 0
+            if no_feasible_control.any():
+                best_values[no_feasible_control] = 1.0
+                best_controls[no_feasible_control] = placeholder_control
+                worst_values[no_feasible_control] = 1.0
             feasible_fraction = feasible_counts / float(control_grid.shape[0])
             feasible_fraction_chunks.append(feasible_fraction.detach())
             fallback_mask_chunks.append(fallback_mask.detach())
@@ -1012,6 +1014,7 @@ def compute_optimal_next_omega_grid_labels(
             for values, u_start in zip(stored_value_chunks, stored_control_starts):
                 near_count = near_count + (values <= near_limit.unsqueeze(1)).to(dtype=dtype).sum(dim=1)
             near_fraction = near_count / float(control_grid.shape[0])
+            near_fraction = torch.where(no_feasible_control, torch.ones_like(near_fraction), near_fraction)
             control_weight = (1.0 - near_fraction).clamp(0.0, 1.0)
             near_fraction_chunks.append(near_fraction.detach())
             control_weight_chunks.append(control_weight.detach())
@@ -1021,7 +1024,13 @@ def compute_optimal_next_omega_grid_labels(
         if resolve_ambiguous_for_policy:
             midpoint_controls = midpoint.expand(bsz, -1)
             midpoint_next = system.dynamics(xb, midpoint_controls)
-            midpoint_value_chunks.append(omega.query(midpoint_next).detach())
+            midpoint_values = omega.query(midpoint_next).detach()
+            if mask_out_of_domain_successors:
+                midpoint_values = torch.where(
+                    points_in_bounds(midpoint_next, successor_domain),
+                    midpoint_values, torch.ones_like(midpoint_values),
+                )
+            midpoint_value_chunks.append(midpoint_values)
 
     u_opt = torch.cat(u_opt_chunks, dim=0)
     omega_opt_next = torch.cat(value_chunks, dim=0)
@@ -1070,7 +1079,20 @@ def compute_optimal_next_omega_grid_labels(
             midpoint_default_mask[ambiguous_mask] = True
 
         resolved_next = system.dynamics(x, resolved_controls)
+        if mask_out_of_domain_successors:
+            # Ambiguity resolution must not replace a contained grid choice
+            # with a neighbor's control whose successor leaves this domain.
+            rejected = ~points_in_bounds(resolved_next, successor_domain)
+            resolved_controls[rejected] = u_opt[rejected]
+            neighbor_imputed_mask[rejected] = False
+            midpoint_default_mask[rejected] = False
+            resolved_next = system.dynamics(x, resolved_controls)
         omega_opt_next = omega.query(resolved_next).detach()
+        if mask_out_of_domain_successors:
+            omega_opt_next = torch.where(
+                points_in_bounds(resolved_next, successor_domain),
+                omega_opt_next, torch.ones_like(omega_opt_next),
+            )
 
     return PolicyLabelBatch(
         x=x,
@@ -1473,14 +1495,14 @@ def refresh_lqr_switch_levels(
             "Cannot place the sample cap between c1 and C_S: "
             f"c1={c_analytic}, C_S={c_s}."
         )
-    c_sigmoid_center = float(c_analytic) + float(c1_scale) * (
+    C_sample_cap = float(c_analytic) + float(c1_scale) * (
         float(c_s) - float(c_analytic)
     )
     artifacts.c_box = float(domain_cap)
     artifacts.c_box_by_dim = domain_cap_by_dim
     artifacts.c_s = float(c_s)
     artifacts.c_analytic = float(c_analytic)
-    artifacts.c_sigmoid_center = float(c_sigmoid_center)
+    artifacts.C_sample_cap = float(C_sample_cap)
     artifacts.sublevels = replace_sublevel_record(
         artifacts.sublevels,
         "controller_lqr_off_level_C_S",
@@ -1515,7 +1537,7 @@ def refresh_lqr_switch_levels(
         "controller_sample_cap",
         SublevelRecord(
             name="controller_sample_cap",
-            value=float(c_sigmoid_center),
+            value=float(C_sample_cap),
             formula="c1 + c1_scale * (C_S - c1)",
             notes=(
                 "The c1-to-C_S band sampler uses this as its scaled sample cap.",
@@ -1983,7 +2005,7 @@ def compute_lqr_box_artifacts(
     }
     c_s = min(lqr.c_input, c_box)
     c_analytic = c_analytic_certified
-    c_sigmoid_center = float(c_analytic) + float(system.training.c1_scale) * (
+    C_sample_cap = float(c_analytic) + float(system.training.c1_scale) * (
         float(c_s) - float(c_analytic)
     )
     domain_box = tuple((-float(r), float(r)) for r in system.local_decrease.box_radii)
@@ -2064,7 +2086,7 @@ def compute_lqr_box_artifacts(
         nonlinear_decrease_constants=nonlinear_constants,
         c_analytic=c_analytic,
         c_s=c_s,
-        c_sigmoid_center=c_sigmoid_center,
+        C_sample_cap=C_sample_cap,
         domain_box=domain_box,
         sublevels=sublevels,
         notes=(
@@ -2082,19 +2104,22 @@ def compute_stepwise_min_zubov_values(
     x_batch: torch.Tensor,
     p_matrix: torch.Tensor,
     *,
+    k_matrix: torch.Tensor,
     horizon: int,
     ntraj: int,
     control_sampler: Optional[Callable[[Tuple[int, ...], torch.device, torch.dtype], torch.Tensor]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Return finite-horizon stepwise-min reachability values `(V, W)`.
 
-    This follows the intended notebook logic using sampled controls. It is a
-    finite-horizon approximation to the stepwise minimum over the reachable set;
-    it is not a proof that the true reachable-set minimum has been found.
+    Use ntraj sampled-control trajectories, one clamped-LQR trajectory, and
+    2**u_dim constant-control trajectories (one per control-box vertex).
+    This remains a finite-horizon approximation to the reachable-set minimum,
+    not a proof that the true minimum has been found.
 
     Intended tensor shapes:
       x_batch: (N, n_dim)
       x_cur:   (N, ntraj, n_dim)
+      x_vertex: (N, 2**u_dim, n_dim)
       u:       (N, ntraj, u_dim)
       nu_step: (N, ntraj)
       V:       (N,)
@@ -2102,8 +2127,8 @@ def compute_stepwise_min_zubov_values(
     Intended accumulation:
       For k = 0..horizon:
         alpha_step = zubov_alpha_scale * dt * nu(x_cur)
-        V += min over trajectory axis of alpha_step
-        sample random controls and step all trajectories if k < horizon
+        V += min(sampled, clamped-LQR, constant-vertex alpha_step)
+        advance each bank under its own controls if k < horizon
 
     Important: the minimum is stepwise. It is not the minimum total cost over a
     single complete sampled trajectory.
@@ -2117,9 +2142,16 @@ def compute_stepwise_min_zubov_values(
         raise ValueError("horizon must be nonnegative.")
     if ntraj <= 0:
         raise ValueError("ntraj must be positive.")
+    k_matrix = k_matrix.to(device=device, dtype=dtype)
+    if k_matrix.shape != (system.u_dim, system.n_dim) or not torch.isfinite(k_matrix).all():
+        raise ValueError("k_matrix must be finite with shape (system.u_dim, system.n_dim).")
 
     sampler = control_sampler
     x_cur = x_batch.unsqueeze(1).expand(n_batch, ntraj, system.n_dim).clone()
+    x_lqr = x_batch.clone()
+    vertices = control_hyperrectangle_vertices(system, device=device, dtype=dtype)
+    x_vertex = x_batch.unsqueeze(1).expand(n_batch, vertices.shape[0], system.n_dim).clone()
+    u_vertex = vertices.unsqueeze(0).expand(n_batch, -1, -1)
     accumulated = torch.zeros(n_batch, device=device, dtype=dtype)
 
     for k in range(horizon + 1):
@@ -2130,6 +2162,22 @@ def compute_stepwise_min_zubov_values(
             scale=system.training.zubov_alpha_scale,
         )
         step_min = alpha_step.min(dim=1).values
+        lqr_step = zubov_alpha_from_nu(
+            nu_from_p(x_lqr, p_matrix), dt=system.dt,
+            scale=system.training.zubov_alpha_scale,
+        )
+        # An unstable LQR candidate must not poison finite sampled minima.
+        lqr_step = torch.where(torch.isfinite(lqr_step), lqr_step, torch.full_like(lqr_step, torch.inf))
+        step_min = torch.minimum(step_min, lqr_step)
+        vertex_step = zubov_alpha_from_nu(
+            nu_from_p(x_vertex, p_matrix), dt=system.dt,
+            scale=system.training.zubov_alpha_scale,
+        )
+        # Divergent vertex trajectories must not poison other finite candidates.
+        vertex_step = torch.where(
+            torch.isfinite(vertex_step), vertex_step, torch.full_like(vertex_step, torch.inf)
+        )
+        step_min = torch.minimum(step_min, vertex_step.min(dim=1).values)
         accumulated += step_min
         if k < horizon:
             if sampler is None:
@@ -2147,6 +2195,8 @@ def compute_stepwise_min_zubov_values(
                     f"{(n_batch, ntraj, system.u_dim)}, got {tuple(u.shape)}"
                 )
             x_cur = system.dynamics(x_cur, u)
+            x_lqr = system.dynamics(x_lqr, lqr_control(system, x_lqr, k_matrix))
+            x_vertex = system.dynamics(x_vertex, u_vertex)
 
     target_w = 1.0 - torch.exp(-accumulated)
     return accumulated, target_w.clamp(0.0, 1.0)
@@ -2158,6 +2208,7 @@ def compute_stepwise_min_zubov_targets(
     x_batch: torch.Tensor,
     p_matrix: torch.Tensor,
     *,
+    k_matrix: torch.Tensor,
     horizon: int,
     ntraj: int,
     control_sampler: Optional[Callable[[Tuple[int, ...], torch.device, torch.dtype], torch.Tensor]] = None,
@@ -2167,46 +2218,10 @@ def compute_stepwise_min_zubov_targets(
     Each source state contributes one degenerate-zonotope embedding for the
     full stepwise-min finite horizon.
     """
-    device = x_batch.device
-    dtype = x_batch.dtype
-    n_batch = x_batch.shape[0]
-    if x_batch.shape[-1] != system.n_dim:
-        raise ValueError("x_batch last dimension must equal system.n_dim.")
-    if horizon < 0:
-        raise ValueError("horizon must be nonnegative.")
-    if ntraj <= 0:
-        raise ValueError("ntraj must be positive.")
-
-    x_cur = x_batch.unsqueeze(1).expand(n_batch, ntraj, system.n_dim).clone()
-    accumulated = torch.zeros(n_batch, device=device, dtype=dtype)
-
-    for k in range(horizon + 1):
-        nu_step = nu_from_p(x_cur, p_matrix)
-        alpha_step = zubov_alpha_from_nu(
-            nu_step,
-            dt=system.dt,
-            scale=system.training.zubov_alpha_scale,
-        )
-        step_min = alpha_step.min(dim=1).values
-        accumulated += step_min
-        if k < horizon:
-            if control_sampler is None:
-                u = sample_uniform_controls(
-                    system,
-                    (n_batch, ntraj),
-                    device=device,
-                    dtype=dtype,
-                )
-            else:
-                u = control_sampler((n_batch, ntraj), device, dtype)
-            if u.shape != (n_batch, ntraj, system.u_dim):
-                raise ValueError(
-                    "control_sampler must return shape "
-                    f"{(n_batch, ntraj, system.u_dim)}, got {tuple(u.shape)}"
-                )
-            x_cur = system.dynamics(x_cur, u)
-
-    target_w = (1.0 - torch.exp(-accumulated)).clamp(0.0, 1.0)
+    _, target_w = compute_stepwise_min_zubov_values(
+        system, x_batch, p_matrix, k_matrix=k_matrix,
+        horizon=horizon, ntraj=ntraj, control_sampler=control_sampler,
+    )
     return OmegaLabelBatch(
         x=x_batch.detach(),
         z_x=embed_singleton_zonotope(system, x_batch).detach(),
@@ -2392,18 +2407,64 @@ def closed_loop_omega_loss_terms(
     )
 
 
-def policy_control_for_mode(pi: PiNet, x: torch.Tensor, mode: str) -> torch.Tensor:
-    """Return the controller branch used by closed-loop value training."""
+def validate_blended_controller_artifacts(
+    pi: PiNet,
+    p_matrix: torch.Tensor,
+    k_matrix: torch.Tensor,
+    *,
+    c1: float,
+) -> None:
+    """Check that the blend uses the LQR data defining its analytic midpoint."""
+    if not math.isfinite(float(c1)) or float(c1) <= 0.0:
+        raise ValueError(f"Blend midpoint c1 must be finite and positive, got {c1}.")
+    for name, saved, reference in (
+        ("P", pi.P_matrix, p_matrix),
+        ("K", pi.K_matrix, k_matrix),
+    ):
+        reference = reference.to(device=saved.device, dtype=saved.dtype)
+        if saved.shape != reference.shape or not torch.allclose(
+            saved, reference, rtol=1e-6, atol=1e-8,
+        ) or not torch.isfinite(saved).all():
+            raise ValueError(
+                f"tanh_blend requires policy checkpoint {name} to match the "
+                "LQR artifacts defining c_analytic; refusing inconsistent closed-loop training."
+            )
+
+
+def policy_control_for_mode(
+    pi: PiNet, x: torch.Tensor, mode: str, *, c1: Optional[float] = None,
+) -> torch.Tensor:
+    """Select a CL training controller independently of hard-switch verification."""
     normalized = str(mode).strip().lower()
     if normalized in {"nn", "neural", "neural_net", "saturated_nn", "tanh_nn"}:
         return pi.nn_control(x)
     if normalized in {"lqr", "linear"}:
         return pi.lqr_control(x)
+    if normalized == "tanh_blend":
+        if c1 is None:
+            raise ValueError("tanh_blend requires an explicit analytic c1 midpoint.")
+        return pi.blended_control(x, c1=c1)
     raise ValueError(
-        "closed_loop_controller_mode must be 'nn' or 'lqr'; blended/sigmoid "
-        "controllers are not part of the discontinuous-switch proof path, "
+        "closed_loop_controller_mode must be 'nn', 'lqr', or 'tanh_blend', "
         f"got {mode!r}."
     )
+
+
+def closed_loop_controller_metadata(
+    mode: str, *, c1: Optional[float] = None,
+) -> Dict[str, object]:
+    """Record the actual training controller without relabeling legacy modes."""
+    metadata: Dict[str, object] = {"controller_mode": str(mode)}
+    if str(mode).strip().lower() == "tanh_blend":
+        if c1 is None or not math.isfinite(float(c1)) or float(c1) <= 0.0:
+            raise ValueError("tanh_blend metadata requires a finite, positive analytic c1.")
+        metadata.update({
+            "blend_midpoint_source": "c_analytic",
+            "blend_midpoint": float(c1),
+            "blend_k": math.atanh(0.5) / float(c1),
+            "nn_weight_formula": "tanh(blend_k * (x^T P x))",
+        })
+    return metadata
 
 
 @torch.no_grad()
@@ -2417,6 +2478,7 @@ def evaluate_closed_loop_decrease_report(
     source_ids: torch.Tensor,
     *,
     controller_mode: str,
+    c1: Optional[float] = None,
     batch_size: int,
     dos_gate: float,
     eps: float,
@@ -2445,7 +2507,7 @@ def evaluate_closed_loop_decrease_report(
     }
     for start in range(0, states.shape[0], int(batch_size)):
         x = states[start : start + int(batch_size)]
-        u = policy_control_for_mode(pi, x, controller_mode)
+        u = policy_control_for_mode(pi, x, controller_mode, c1=c1)
         x_next = system.dynamics(x, u)
         pieces["source"].append(source_ids[start : start + int(batch_size)].detach().cpu())
         pieces["nu"].append(nu_from_p(x, p_matrix).detach().cpu())
@@ -2514,7 +2576,7 @@ def evaluate_closed_loop_decrease_report(
         per_source[source_names.get(source_id, f"source_{source_id}")] = summarize(arrays["source"] == source_id)
 
     return {
-        "controller_mode": str(controller_mode),
+        **closed_loop_controller_metadata(controller_mode, c1=c1),
         "eps": float(eps),
         "dos_gate": float(dos_gate),
         "domain": [[float(lo), float(hi)] for lo, hi in domain],
@@ -2651,6 +2713,7 @@ def compute_closed_loop_zubov_targets(
     *,
     horizon: int,
     controller_mode: str,
+    c1: Optional[float] = None,
     value_input_dim: Optional[int] = None,
 ) -> OmegaLabelBatch:
     """Finite-horizon W labels along the learned closed-loop dynamics.
@@ -2675,7 +2738,7 @@ def compute_closed_loop_zubov_targets(
             dt=system.dt,
             scale=system.training.zubov_alpha_scale,
         )
-        x_cur = system.dynamics(x_cur, policy_control_for_mode(pi, x_cur, controller_mode))
+        x_cur = system.dynamics(x_cur, policy_control_for_mode(pi, x_cur, controller_mode, c1=c1))
     target_w = 1.0 - torch.exp(-accumulated)
     input_dim = int(value_input_dim) if value_input_dim is not None else system.n_dim
     return OmegaLabelBatch(
@@ -2687,6 +2750,61 @@ def compute_closed_loop_zubov_targets(
         ).detach(),
         target_w=target_w.detach(),
     )
+
+
+@torch.no_grad()
+def filter_feasible_policy_labels(
+    system: SystemSpec,
+    labels: PolicyLabelBatch,
+    source_ids: torch.Tensor,
+    *,
+    batch_size: int,
+) -> Tuple[PolicyLabelBatch, torch.Tensor, Dict[str, object]]:
+    """Recheck fresh/cached targets; placeholders must never supervise PiNet."""
+    if labels.feasible_control_fraction is None:
+        raise ValueError("Policy labels lack feasibility metadata; regenerate the label cache.")
+    if batch_size <= 0 or source_ids.numel() != labels.x.shape[0]:
+        raise ValueError("Invalid policy feasibility batch size or source-id count.")
+    domain = tuple(zip(system.x_lb, system.x_hi))
+    input_bounds = tuple(zip(system.u_lb, system.u_hi))
+    keep_chunks = []
+    no_grid = 0
+    invalid_target = 0
+    for start in range(0, labels.x.shape[0], batch_size):
+        stop = start + batch_size
+        x, u = labels.x[start:stop], labels.u_opt[start:stop]
+        next_x = system.dynamics(x, u)
+        fraction = labels.feasible_control_fraction[start:stop]
+        has_grid = torch.isfinite(fraction) & (fraction > 0)
+        valid = (
+            points_in_bounds(x, domain)
+            & points_in_bounds(u, input_bounds)
+            & torch.isfinite(next_x).all(dim=-1)
+            & points_in_bounds(next_x, domain)
+            & torch.isfinite(labels.omega_opt_next[start:stop])
+        )
+        keep_chunks.append(has_grid & valid)
+        no_grid += int((~has_grid).sum().item())
+        invalid_target += int((~valid).sum().item())
+    keep = torch.cat(keep_chunks) if keep_chunks else torch.zeros(
+        0, device=labels.x.device, dtype=torch.bool
+    )
+    filtered = replace(labels, **{
+        field.name: (getattr(labels, field.name)[keep] if getattr(labels, field.name) is not None else None)
+        for field in fields(labels)
+    })
+    kept_sources = source_ids[keep.to(device=source_ids.device)]
+    return filtered, kept_sources, {
+        "input_points": int(keep.numel()),
+        "kept_points": int(keep.sum().item()),
+        "removed_points": int((~keep).sum().item()),
+        "no_feasible_grid_control_points": no_grid,
+        "invalid_selected_control_or_successor_or_value_points": invalid_target,
+        "reason_counts_can_overlap": True,
+        "domain": [[float(lo), float(hi)] for lo, hi in domain],
+        "source_counts_before": {str(int(s)): int((source_ids == s).sum()) for s in source_ids.unique()},
+        "source_counts_after": {str(int(s)): int((kept_sources == s).sum()) for s in source_ids.unique()},
+    }
 
 
 def policy_next_omega_mse(
@@ -2762,6 +2880,7 @@ def evaluate_boundary_stepwise_min_reachability(
     system: SystemSpec,
     p_matrix: torch.Tensor,
     *,
+    k_matrix: torch.Tensor,
     bounds: Optional[Tuple[Tuple[float, float], ...]] = None,
     points_per_face: Optional[int] = None,
     horizon: Optional[int] = None,
@@ -2793,6 +2912,7 @@ def evaluate_boundary_stepwise_min_reachability(
             system,
             xb,
             p_matrix,
+            k_matrix=k_matrix,
             horizon=horizon,
             ntraj=ntraj,
         )
@@ -2807,6 +2927,7 @@ def diagnose_domain_boundary_stepwise_min(
     system: SystemSpec,
     p_matrix: torch.Tensor,
     *,
+    k_matrix: torch.Tensor,
     bounds: Optional[Tuple[Tuple[float, float], ...]] = None,
     points_per_face: Optional[int] = None,
     horizon: Optional[int] = None,
@@ -2833,6 +2954,7 @@ def diagnose_domain_boundary_stepwise_min(
     boundary, _, w_values = evaluate_boundary_stepwise_min_reachability(
         system,
         p_matrix,
+        k_matrix=k_matrix,
         bounds=bounds,
         points_per_face=points_per_face,
         horizon=horizon,
@@ -2853,7 +2975,7 @@ def diagnose_domain_boundary_stepwise_min(
         n_below_threshold=n_below,
         should_expand=n_below > 0,
         notes=(
-            "Uses sampled controls and stepwise minima; this is not a proof.",
+            "Uses sampled trajectories, one clamped-LQR trajectory, and one constant trajectory per control-box vertex with stepwise minima; this is not a proof.",
             "If any boundary W is below threshold, expand the training/search rectangle.",
         ),
     )
@@ -2928,6 +3050,7 @@ def expand_domain_by_stepwise_min_reachability(
     system: SystemSpec,
     p_matrix: torch.Tensor,
     *,
+    k_matrix: torch.Tensor,
     device: Optional[torch.device] = None,
 ) -> Tuple[ReachabilityExpansionResult, Tuple[Tuple[float, float], ...], torch.Tensor, torch.Tensor, torch.Tensor]:
     """Expand the state box until boundary stepwise-min W saturates near one.
@@ -2971,6 +3094,7 @@ def expand_domain_by_stepwise_min_reachability(
         boundary, v_values, w_values = evaluate_boundary_stepwise_min_reachability(
             system,
             p_matrix,
+            k_matrix=k_matrix,
             bounds=bounds,
             points_per_face=cfg.boundary_diagnostic_points_per_face,
             horizon=cfg.boundary_diagnostic_horizon,
@@ -3163,8 +3287,9 @@ def save_loss_history_artifacts(
 
     epochs = [int(row["epoch"]) for row in history]
     fig, ax = plt.subplots(figsize=(8, 5))
+    skip_plot_keys = {"epoch", "minibatches", "examples_seen", "total"}
     for key in history[0]:
-        if key == "epoch":
+        if key in skip_plot_keys:
             continue
         values = [max(float(row[key]), 1e-16) for row in history]
         ax.semilogy(epochs, values, lw=2, label=key)
@@ -3511,6 +3636,159 @@ def iter_threshold_grid_batches(
             index_batch[:count, dim] = (flat // stride) % int(points_per_dim)
             point_batch[:count, dim] = axes[dim][index_batch[:count, dim]]
         yield point_batch[:count]
+
+
+@torch.no_grad()
+def quadratic_control_grid_search(
+    system: SystemSpec,
+    p_matrix: torch.Tensor,
+    *,
+    c1: float = 0.0,
+    device: Optional[torch.device] = None,
+) -> Dict[str, object]:
+    """Empirical largest box-contained quadratic sublevel with a decreasing grid control.
+
+    Search nu >= c1; the supplied analytic local region covers nu < c1.
+    No c2 exclusion is applied. The minimum is over contained successors.
+    Standalone callers omitting c1 search all nonzero grid states.
+    Neither the finite grid nor shrinking the result constitutes a proof.
+    """
+    cfg = system.training
+    device = torch.device(device if device is not None else p_matrix.device)
+    if device.type != "cuda":
+        raise ValueError("Quadratic control search requires CUDA; no CPU fallback.")
+    domain = tuple((float(lo), float(hi)) for lo, hi in zip(system.x_lb, system.x_hi))
+    if system.verification is not None:
+        domain = tuple((max(lo, vlo), min(hi, vhi))
+                       for (lo, hi), (vlo, vhi) in zip(domain, system.verification.domain))
+    if len(domain) != system.n_dim or any(not (math.isfinite(lo) and math.isfinite(hi) and lo < 0 < hi)
+                                          for lo, hi in domain):
+        raise ValueError("Quadratic search requires a finite box containing the origin in its interior.")
+    requested = cfg.quadratic_control_search_samples
+    requested = cfg.threshold_search_samples if requested is None else requested
+    state_n, total = threshold_grid_shape(domain, requested)
+    control_n = cfg.quadratic_control_search_points_per_dim
+    state_batch = cfg.quadratic_control_search_state_batch_size
+    control_batch = cfg.quadratic_control_search_control_batch_size
+    scale = float(cfg.quadratic_control_search_scale)
+    eps = float(cfg.quadratic_control_search_decrease_eps)
+    c1 = float(c1)
+    if not math.isfinite(c1) or c1 < 0:
+        raise ValueError("Quadratic search requires a finite, nonnegative analytic c1.")
+    if control_n < 2 or state_batch < 1 or control_batch < 1:
+        raise ValueError("Quadratic search needs >=2 controls per axis and positive batch sizes.")
+    if not 0 < scale < 1 or not math.isfinite(eps) or eps < 0:
+        raise ValueError("Quadratic search requires 0 < scale < 1 and finite decrease_eps >= 0.")
+    control_domain = tuple((float(lo), float(hi)) for lo, hi in zip(system.u_lb, system.u_hi))
+    if any(not (math.isfinite(lo) and math.isfinite(hi) and lo <= hi) for lo, hi in control_domain):
+        raise ValueError("Invalid quadratic-search input bounds.")
+    total_controls = control_n ** system.u_dim
+    p = p_matrix.detach().to(device=device, dtype=torch.float64)
+    if p.shape != (system.n_dim, system.n_dim) or not torch.isfinite(p).all():
+        raise ValueError("Invalid quadratic matrix.")
+    if not torch.allclose(p, p.T, rtol=1e-10, atol=1e-12):
+        raise ValueError("Quadratic matrix must be symmetric.")
+    if float(torch.linalg.eigvalsh(p).min()) <= 0:
+        raise ValueError("Quadratic matrix must be positive definite.")
+    radii = p.new_tensor([min(-lo, hi) for lo, hi in domain])
+    box_cap = float((radii.square() / torch.linalg.inv(p).diagonal()).min())
+    raw = None
+    witness = None
+    bad_count = no_feasible_count = origin_count = core_count = evaluated_count = 0
+    print(f"Quadratic control diagnostic: {total:,} states x {total_controls:,} controls; float64 CUDA.")
+    for x in iter_threshold_grid_batches(domain, points_per_dim=state_n, total_points=total,
+                                         batch_size=state_batch, device=device, dtype=p.dtype):
+        nu = nu_from_p(x, p)
+        if not torch.isfinite(nu).all():
+            raise ValueError("Nonfinite quadratic state value; refusing a threshold.")
+        nonzero = (x != 0).any(dim=1)
+        origin_count += int((~nonzero).sum())
+        core_count += int((nonzero & (nu < c1)).sum())
+        eligible = nonzero & (nu >= c1)
+        x, nu = x[eligible], nu[eligible]
+        evaluated_count += len(x)
+        if not len(x):
+            continue
+        best = torch.full_like(nu, float("inf"))
+        best_u = torch.zeros((len(x), system.u_dim), device=device, dtype=p.dtype)
+        for u in iter_threshold_grid_batches(control_domain, points_per_dim=control_n,
+                total_points=total_controls, batch_size=control_batch, device=device, dtype=p.dtype):
+            xx = x[:, None, :].expand(-1, len(u), -1).reshape(-1, system.n_dim)
+            uu = u[None, :, :].expand(len(x), -1, -1).reshape(-1, system.u_dim)
+            fx = system.dynamics(xx, uu)
+            next_nu = nu_from_p(fx, p)
+            if not torch.isfinite(fx).all() or not torch.isfinite(next_nu).all():
+                raise ValueError("Nonfinite quadratic-search successor; refusing a threshold.")
+            next_nu = next_nu.masked_fill(~points_in_bounds(fx, domain), float("inf"))
+            candidate, index = next_nu.reshape(len(x), len(u)).min(dim=1)
+            improved = candidate < best
+            best_u[improved] = u[index[improved]]
+            best = torch.minimum(best, candidate)
+        feasible = torch.isfinite(best)
+        bad = ~feasible | (best - nu >= -eps)
+        no_feasible_count += int((~feasible).sum())
+        bad_count += int(bad.sum())
+        if bad.any():
+            index = int(nu.masked_fill(~bad, float("inf")).argmin())
+            value = float(nu[index])
+            if raw is None or value < raw:
+                raw = value
+                has_control = bool(feasible[index])
+                successor = system.dynamics(x[index:index+1], best_u[index:index+1]) if has_control else None
+                witness = dict(x=x[index].tolist(), nu=value,
+                    best_control=best_u[index].tolist() if has_control else None,
+                    successor=successor[0].tolist() if has_control else None,
+                    min_successor_nu=float(best[index]) if has_control else None,
+                    min_delta_nu=float(best[index]-nu[index]) if has_control else None,
+                    reason="no_strict_decrease" if has_control else "all_controls_exit_domain")
+    limit = box_cap if raw is None else min(raw, box_cap)
+    return dict(system=system.name, status="empirical_grid_only", P=p.tolist(),
+        domain=domain, input_domain=control_domain, dt=float(system.dt),
+        requested_states=requested, state_points_per_dim=state_n, state_points=total,
+        control_points_per_dim=control_n, controls=total_controls,
+        state_batch_size=state_batch, control_batch_size=control_batch, dtype="float64",
+        decrease_eps=eps, origin_excluded_count=origin_count, violation_count=bad_count,
+        c1=c1, analytic_core_excluded_count=core_count, evaluated_states=evaluated_count,
+        all_controls_exit_count=no_feasible_count, first_violation_nu=raw, witness=witness,
+        domain_containment_cap=box_cap, limiting_level=limit, scale=scale,
+        level=scale*limit, limited_by="domain" if raw is None or box_cap <= raw else "decrease_violation",
+        notes=["min over contained grid controls of nu(f)-nu must be strictly below -decrease_eps.",
+               "Search nu>=c1 outside the supplied analytic local region; no c2 exclusion.",
+               "The full ellipsoid is capped to the searched box, not to the LQR input cap.",
+               "A finite-grid empirical estimate, not optimal ROA certification or a controller threshold."])
+
+
+def quadratic_control_plot_overlay(
+    system: SystemSpec, run: Optional[PipelineRun], artifact_dir: Path,
+    p_matrix: torch.Tensor, axes, x_grid: np.ndarray, y_grid: np.ndarray, nu_values: np.ndarray,
+) -> list:
+    """Draw a compatible optional result and return its legend handle."""
+    if not system.training.quadratic_control_search_enabled:
+        return []
+    path = (run.run_dir if run is not None else artifact_dir) / "quadratic_control_search.json"
+    if not path.exists():
+        print(f"Quadratic control contour unavailable: run enabled threshold search first ({path}).")
+        return []
+    result = json.loads(path.read_text(encoding="utf-8"))
+    domain = tuple(zip(system.x_lb, system.x_hi))
+    if system.verification is not None:
+        domain = tuple((max(lo, vlo), min(hi, vhi))
+                       for (lo, hi), (vlo, vhi) in zip(domain, system.verification.domain))
+    if (result["system"] != system.name or result["domain"] != [list(pair) for pair in domain]
+            or result["input_domain"] != [list(pair) for pair in zip(system.u_lb, system.u_hi)]
+            or result["dt"] != float(system.dt)
+            or not np.allclose(result["P"], p_matrix.detach().cpu().numpy(), rtol=1e-6, atol=1e-12)):
+        raise ValueError("Stale/incompatible quadratic control diagnostic; rerun threshold search.")
+    level = float(result["level"])
+    finite = nu_values[np.isfinite(nu_values)]
+    if not math.isfinite(level) or level <= 0 or not finite.size or not finite.min() < level < finite.max():
+        return []
+    for ax in np.asarray(axes).reshape(-1):
+        ax.contour(x_grid, y_grid, nu_values, levels=[level], colors="yellow",
+                   linestyles="-.", linewidths=2.0)
+    from matplotlib.lines import Line2D
+    return [Line2D([0], [0], color="yellow", linestyle="-.", lw=2.0,
+                   label="nu=C_quad_opt (empirical)")]
 
 
 @torch.no_grad()
@@ -4468,6 +4746,10 @@ def save_threshold_diagnostic_plot_2d(
         ax.set_ylabel(labels[1])
         ax.grid(True, alpha=0.2)
 
+    quadratic_handles = quadratic_control_plot_overlay(
+        system, run, artifact_dir, p_matrix, axes, x0_np, x1_np, nu_values)
+    if quadratic_handles:
+        axes[2].legend(handles=quadratic_handles, loc="upper right", framealpha=0.9)
     fig.suptitle("Manual Threshold Diagnostic")
     fig.savefig(plot_dir / "threshold_diagnostic.png", dpi=180)
     plt.close(fig)
@@ -4662,7 +4944,7 @@ def save_value_heatmap_decrease_diagnostic_2d(
     omega_cl: OmegaNet,
     p_matrix: torch.Tensor,
     c_analytic: float,
-    c_sigmoid_center: Optional[float] = None,
+    C_sample_cap: Optional[float] = None,
     c_s: Optional[float] = None,
     thresholds: Optional[Dict[str, float]] = None,
     optimal_grid: Optional[HeatmapOptimalControlGrid] = None,
@@ -4759,7 +5041,7 @@ def save_value_heatmap_decrease_diagnostic_2d(
     mask_payload = {
         "thresholds": {
             "c_analytic": float(c_analytic),
-            "sample_cap": float(c_sigmoid_center) if c_sigmoid_center is not None else None,
+            "sample_cap": float(C_sample_cap) if C_sample_cap is not None else None,
             "C_S": float(c_s) if c_s is not None else None,
             "c2": c2,
             "w1": w1,
@@ -4920,10 +5202,6 @@ def save_value_heatmap_decrease_diagnostic_2d(
         )
         draw_value_contours(ax, values)
         safe_contour(ax, nu_values, [float(c_analytic)], colors="white", linewidths=2.0)
-        if c_sigmoid_center is not None:
-            safe_contour(ax, nu_values, [float(c_sigmoid_center)], colors="orange", linewidths=2.0)
-        if c_s is not None:
-            safe_contour(ax, nu_values, [float(c_s)], colors="red", linewidths=2.0)
         safe_contour(ax, nu_values, [c2], colors="magenta", linewidths=1.8)
         safe_contour(ax, values, [w1], colors="cyan", linestyles=["--"], linewidths=1.8)
         safe_contour(ax, values, [w2], colors="lime", linestyles=["--"], linewidths=1.8)
@@ -4944,10 +5222,8 @@ def save_value_heatmap_decrease_diagnostic_2d(
         Line2D([0], [0], color="white", lw=6, alpha=0.5, label="saturated-NN violation"),
         Line2D([0], [0], color="white", lw=6, alpha=0.5, label="optimal-label violation"),
     ]
-    if c_s is not None:
-        legend_handles.insert(1, Line2D([0], [0], color="red", lw=2.0, label="nu=C_s cap"))
-    if c_sigmoid_center is not None:
-        legend_handles.insert(1, Line2D([0], [0], color="orange", lw=2.0, label="nu=sample cap"))
+    legend_handles.extend(quadratic_control_plot_overlay(
+        system, run, artifact_dir, p_matrix, axes, x0_np, x1_np, nu_values))
     axes[2].legend(handles=legend_handles, loc="upper right", framealpha=0.9)
     fig.suptitle(
         "Value Heatmaps and Decrease-Violation Masks "
@@ -4968,7 +5244,6 @@ def save_pinet_control_slice_diagnostic_2d(
     pi: PiNet,
     p_matrix: torch.Tensor,
     c_analytic: float,
-    c_sigmoid_center: Optional[float] = None,
     c_s: Optional[float] = None,
     thresholds: Optional[Dict[str, float]] = None,
     optimal_grid: Optional[HeatmapOptimalControlGrid] = None,
@@ -5140,8 +5415,6 @@ def save_pinet_control_slice_diagnostic_2d(
             )
             fig.colorbar(cf, ax=ax, label=f"{row_label} u{j}")
             safe_contour(ax, nu_np, [float(c_analytic)], colors="white", linewidths=2.0)
-            if c_s is not None:
-                safe_contour(ax, nu_np, [float(c_s)], colors="red", linewidths=2.0)
             safe_contour(ax, nu_np, [float(c2)], colors="magenta", linewidths=1.8)
             safe_contour(
                 ax,
@@ -5161,8 +5434,8 @@ def save_pinet_control_slice_diagnostic_2d(
         Line2D([0], [0], color="magenta", lw=1.8, label="nu=c2"),
         Line2D([0], [0], color="yellow", lw=1.8, linestyle="--", label="omega_o=policy DOS"),
     ]
-    if c_s is not None:
-        legend_handles.insert(1, Line2D([0], [0], color="red", lw=2.0, label="nu=C_S"))
+    legend_handles.extend(quadratic_control_plot_overlay(
+        system, run, artifact_dir, p_matrix, axes, x0_np, x1_np, nu_np))
     axes[0, -1].legend(handles=legend_handles, loc="upper right", framealpha=0.9)
     fig.suptitle(f"PiNet Saturated NN vs Optimal Control Slice ({labels[axis_pair[0]]}, {labels[axis_pair[1]]})")
     fig.savefig(plot_dir / f"pinet_control_slice_{suffix}.png", dpi=180)
@@ -5325,7 +5598,8 @@ def save_closed_loop_difference_field_diagnostic_2d(
             Line2D([0], [0], color="magenta", lw=1.8, label="nu=c2"),
             Line2D([0], [0], color="lime", lw=1.8, linestyle="--", label="omega_cl=w2"),
             Line2D([0], [0], color="black", lw=6, alpha=0.22, label="decrease violation"),
-        ],
+        ] + quadratic_control_plot_overlay(
+            system, run, artifact_dir, p_matrix, axes, x0_np, x1_np, nu_np),
         loc="upper right",
         framealpha=0.9,
     )
@@ -5542,8 +5816,6 @@ def save_policy_label_gap_diagnostic_2d(
         fig.colorbar(cf, ax=ax, label=title)
         try:
             ax.contour(x0_np, x1_np, nu_values, levels=[float(c_analytic)], colors="white", linewidths=1.6)
-            if c_s is not None:
-                ax.contour(x0_np, x1_np, nu_values, levels=[float(c_s)], colors="red", linewidths=1.6)
             ax.contour(x0_np, x1_np, nu_values, levels=[float(c2)], colors="magenta", linewidths=1.4)
             ax.contour(
                 x0_np,
@@ -5566,8 +5838,8 @@ def save_policy_label_gap_diagnostic_2d(
         Line2D([0], [0], color="magenta", lw=1.4, label="nu=c2"),
         Line2D([0], [0], color="yellow", lw=1.4, linestyle="--", label="omega_o=policy DOS"),
     ]
-    if c_s is not None:
-        legend_handles.insert(1, Line2D([0], [0], color="red", lw=1.6, label="nu=C_S"))
+    legend_handles.extend(quadratic_control_plot_overlay(
+        system, run, artifact_dir, p_matrix, axes, x0_np, x1_np, nu_values))
     axes[-1].legend(handles=legend_handles, loc="upper right", framealpha=0.9)
     fig.suptitle(f"Policy Label Gap Diagnostic ({labels[x_axis]}, {labels[y_axis]})")
     fig.savefig(plot_dir / f"policy_label_gap_diagnostic_{suffix}.png", dpi=180)
@@ -5787,7 +6059,7 @@ class TrainingPipeline:
         print(f"  c_nonlinear_decrease = {artifacts.c_nonlinear_decrease:.9g}")
         print(f"  c_nonlinear_analytic = {artifacts.c_nonlinear_decrease_analytic:.9g}")
         print(f"  c_analytic           = {artifacts.c_analytic:.9g}")
-        print(f"  sample cap           = {artifacts.c_sigmoid_center:.9g}")
+        print(f"  sample cap           = {artifacts.C_sample_cap:.9g}")
         print(f"  C_S                  = {artifacts.c_s:.9g}")
         print(f"  local box B          = {artifacts.domain_box}")
         print(f"  eta_B                = {self.system.local_decrease.eta_bound}")
@@ -5871,6 +6143,7 @@ class TrainingPipeline:
         diagnostic, boundary, w_values = diagnose_domain_boundary_stepwise_min(
             self.system,
             self.lqr_box_artifacts.P,
+            k_matrix=self.lqr_box_artifacts.K,
             device=self.device,
         )
         print("Boundary domain diagnostic complete.")
@@ -5905,8 +6178,8 @@ class TrainingPipeline:
         #                    - xi * (1 - omega(z_next)))^2)
         #
         #   B. Smaller finite-horizon guidance set.
-        #      W_target is generated by random rollouts and the stepwise minimum
-        #      alpha accumulation. It is used in an MSE term:
+        #      W_target uses random, clamped-LQR, and constant-vertex rollouts
+        #      with stepwise-min alpha accumulation. It is used in an MSE term:
         #      L_d = mean((omega(z_data) - W_target)^2)
         #
         # The interval residual must not be replaced by singleton successor
@@ -5946,6 +6219,7 @@ class TrainingPipeline:
             ) = expand_domain_by_stepwise_min_reachability(
                 self.system,
                 p_matrix,
+                k_matrix=k_matrix,
                 device=self.device,
             )
             self.system = _system_with_state_domain(self.system, expanded_bounds)
@@ -6005,7 +6279,7 @@ class TrainingPipeline:
             self.run_context.write_sublevels(self.lqr_box_artifacts.sublevels)
         print(f"  active-domain c_box      = {self.lqr_box_artifacts.c_box:.9g}")
         print(f"  refreshed C_S            = {self.lqr_box_artifacts.c_s:.9g}")
-        print(f"  refreshed sample cap = {self.lqr_box_artifacts.c_sigmoid_center:.9g}")
+        print(f"  refreshed sample cap = {self.lqr_box_artifacts.C_sample_cap:.9g}")
 
         counts = resolve_data_distribution_counts(self.system)
         omega_trajectory_ellipse = self.sample_lqr_c2_band(
@@ -6020,6 +6294,7 @@ class TrainingPipeline:
         reachability_boundary_residual = torch.empty(0, self.system.n_dim, device=self.device)
 
         print("Preparing original omega finite-horizon guidance labels...")
+        print(f"  controls per state      = {cfg.omega_rollouts_per_state} sampled trajectories + 1 clamped-LQR trajectory + {2 ** self.system.u_dim} constant-vertex trajectories")
         print(f"  trajectory uniform     = {counts.omega_trajectory_uniform_points}")
         print(f"  trajectory ellipse     = {omega_trajectory_ellipse.shape[0]}")
         print(f"  reachability boundary  = {reachability_boundary_label.shape[0]}")
@@ -6048,6 +6323,7 @@ class TrainingPipeline:
                     self.system,
                     xb,
                     p_matrix,
+                    k_matrix=k_matrix,
                     horizon=cfg.omega_rollout_horizon,
                     ntraj=cfg.omega_rollouts_per_state,
                 )
@@ -6276,7 +6552,7 @@ class TrainingPipeline:
             "P": self.lqr_box_artifacts.P.detach().cpu().numpy().astype(float).tolist(),
             "K": self.lqr_box_artifacts.K.detach().cpu().numpy().astype(float).tolist(),
             "c_analytic": float(self.lqr_box_artifacts.c_analytic),
-            "sample_cap": float(self.lqr_box_artifacts.c_sigmoid_center),
+            "sample_cap": float(self.lqr_box_artifacts.C_sample_cap),
             "C_S": float(self.lqr_box_artifacts.c_s),
             "zubov_alpha_scale": float(cfg.zubov_alpha_scale),
             "omega_loss": {
@@ -6321,6 +6597,11 @@ class TrainingPipeline:
                 "boundary_noise_std": float(cfg.omega_boundary_noise_std),
                 "rollout_horizon": int(cfg.omega_rollout_horizon),
                 "rollouts_per_state": int(cfg.omega_rollouts_per_state),
+                "deterministic_rollouts_per_state": 1 + 2 ** self.system.u_dim,
+                "deterministic_rollout_controller": "clamped_lqr_and_constant_control_box_vertices",
+                "clamped_lqr_rollouts_per_state": 1,
+                "constant_vertex_rollouts_per_state": 2 ** self.system.u_dim,
+                "guidance_minimum": "per_step_over_sampled_clamped_lqr_and_constant_vertex_trajectories",
                 "label_generation_batch_size": int(omega_label_batch_size),
                 "training_loss_batch": int(cfg.omega_batch_size),
                 "full_pass_epochs": bool(cfg.omega_full_pass_epochs),
@@ -6390,15 +6671,18 @@ class TrainingPipeline:
             if int(metadata.get("control_grid_points", -1)) != int(cfg.control_grid_points):
                 raise ValueError(f"Policy label cache control_grid_points mismatch: {cache_path}")
             cached_mask_domain = bool(metadata.get("policy_label_mask_out_of_domain_successors", False))
-            if cached_mask_domain != bool(cfg.policy_label_mask_out_of_domain_successors):
+            if not cached_mask_domain:
                 raise ValueError(
-                    "Policy label cache successor-domain-mask mismatch: "
-                    f"cache has {cached_mask_domain}, config wants "
-                    f"{bool(cfg.policy_label_mask_out_of_domain_successors)}. Regenerate labels."
+                    "PiNet training requires domain-masked control labels. "
+                    "Regenerate this unmasked policy label cache."
                 )
             cached_selection_mode = normalize_policy_label_selection_mode(
                 metadata.get("policy_label_selection_mode", "argmin")
             )
+            if cached_mask_domain and metadata.get("successor_mask_semantics") != "contained_or_one_v1":
+                raise ValueError(
+                    "Policy label cache uses obsolete successor-mask semantics. Regenerate labels."
+                )
             if cached_selection_mode != "argmin":
                 raise ValueError(
                     "Policy label cache selection-mode mismatch: "
@@ -6447,7 +6731,7 @@ class TrainingPipeline:
             if labels.near_optimal_fraction is None:
                 labels.near_optimal_fraction = torch.zeros(labels.x.shape[0], device=self.device, dtype=torch.float32)
             if labels.feasible_control_fraction is None:
-                labels.feasible_control_fraction = torch.ones(labels.x.shape[0], device=self.device, dtype=torch.float32)
+                raise ValueError("Policy label cache lacks feasibility metadata. Regenerate labels.")
             if labels.unmasked_fallback_mask is None:
                 labels.unmasked_fallback_mask = torch.zeros(labels.x.shape[0], device=self.device, dtype=torch.bool)
             if not bool(cfg.policy_label_use_confidence_weight):
@@ -6578,7 +6862,7 @@ class TrainingPipeline:
             print(f"  grid points per dim      = {cfg.control_grid_points}")
             print("  label selection mode     = argmin")
             print(f"  confidence weights       = {cfg.policy_label_use_confidence_weight}")
-            print(f"  mask OOD successors      = {cfg.policy_label_mask_out_of_domain_successors}")
+            print("  mask OOD successors      = True (required for PiNet training)")
             print(f"  near-optimal rel tol     = {cfg.policy_label_near_optimal_rel_tol}")
             labels = compute_optimal_next_omega_grid_labels(
                 self.system,
@@ -6589,8 +6873,8 @@ class TrainingPipeline:
                 resolve_ambiguous_for_policy=False,
                 near_optimal_rel_tol=cfg.policy_label_near_optimal_rel_tol,
                 compute_control_confidence=bool(cfg.policy_label_use_confidence_weight),
-                mask_out_of_domain_successors=bool(cfg.policy_label_mask_out_of_domain_successors),
-                successor_domain=tuple(tuple(v) for v in self.system.verification.domain),
+                mask_out_of_domain_successors=True,
+                successor_domain=tuple(zip(self.system.x_lb, self.system.x_hi)),
             )
             if labels.control_weight is None:
                 labels.control_weight = torch.ones(labels.x.shape[0], device=self.device, dtype=torch.float32)
@@ -6611,10 +6895,11 @@ class TrainingPipeline:
             fallback_mask = labels.unmasked_fallback_mask
             label_filter_summary["control_label_resolution"] = {
                 "mode": "argmin",
-                "successor_domain_mask": bool(cfg.policy_label_mask_out_of_domain_successors),
+                "successor_domain_mask": True,
+                "configured_successor_domain_mask": bool(cfg.policy_label_mask_out_of_domain_successors),
                 "successor_domain": [
                     [float(lo), float(hi)]
-                    for lo, hi in self.system.verification.domain
+                    for lo, hi in zip(self.system.x_lb, self.system.x_hi)
                 ],
                 "label_target": "exact_grid_argmin",
                 "weighted_term": (
@@ -6637,6 +6922,8 @@ class TrainingPipeline:
                 "feasible_control_fraction_mean": float(labels.feasible_control_fraction.mean().detach().cpu().item()),
                 "feasible_control_fraction_p05": float(torch.quantile(labels.feasible_control_fraction, 0.05).detach().cpu().item()),
                 "unmasked_fallback_points": int(fallback_mask.sum().item()),
+                "no_feasible_grid_control_points": int((labels.feasible_control_fraction == 0).sum().item()),
+                "no_feasible_grid_control_target": 1.0,
                 "control_weight_min": float(labels.control_weight.min().detach().cpu().item()),
                 "control_weight_mean": float(labels.control_weight.mean().detach().cpu().item()),
                 "control_weight_p05": float(torch.quantile(labels.control_weight, 0.05).detach().cpu().item()),
@@ -6667,7 +6954,9 @@ class TrainingPipeline:
                     "control_grid_total_points": int(control_grid.shape[0]),
                     "policy_label_selection_mode": "argmin",
                     "policy_label_use_confidence_weight": bool(cfg.policy_label_use_confidence_weight),
-                    "policy_label_mask_out_of_domain_successors": bool(cfg.policy_label_mask_out_of_domain_successors),
+                    "policy_label_mask_out_of_domain_successors": True,
+                    "successor_domain": [[float(lo), float(hi)] for lo, hi in zip(self.system.x_lb, self.system.x_hi)],
+                    "successor_mask_semantics": "contained_or_one_v1",
                     "policy_label_near_optimal_rel_tol": float(cfg.policy_label_near_optimal_rel_tol),
                     "policy_label_dos_sublevel": float(cfg.policy_label_dos_sublevel),
                     "omega_checkpoint": str(omega_path),
@@ -6676,6 +6965,16 @@ class TrainingPipeline:
             label_cache_path = artifact_dir / "policy_grid_labels.pt"
             torch.save(cache_payload, label_cache_path)
             label_filter_summary["saved_policy_label_cache"] = str(label_cache_path)
+        labels, policy_source_ids, feasibility_summary = filter_feasible_policy_labels(
+            self.system, labels, policy_source_ids, batch_size=cfg.control_grid_batch_size
+        )
+        label_filter_summary["control_feasibility_filter"] = feasibility_summary
+        label_filter_summary["kept_points"] = feasibility_summary["kept_points"]
+        label_filter_summary["removed_points"] = int(label_filter_summary["input_points"]) - feasibility_summary["kept_points"]
+        label_filter_summary["kept_fraction"] = feasibility_summary["kept_points"] / max(1, int(label_filter_summary["input_points"]))
+        for source_id, key in enumerate(("policy_ellipse_boundary_points", "policy_uniform_points", "policy_rejection_omega_sublevel_points")):
+            label_filter_summary[key] = int((policy_source_ids == source_id).sum())
+        print(f"  feasible policy targets = {labels.x.shape[0]} / {feasibility_summary['input_points']}")
         x_train = labels.x
         if self.run_context is not None:
             self.run_context.write_json("policy_label_dos_filtration.json", label_filter_summary)
@@ -6684,6 +6983,9 @@ class TrainingPipeline:
                 json.dumps(label_filter_summary, indent=2),
                 encoding="utf-8",
             )
+
+        if x_train.shape[0] == 0:
+            raise ValueError("No feasible policy control labels remain; see policy_label_dos_filtration.json.")
 
         pi = PiNet(
             n_dim=self.system.n_dim,
@@ -6913,8 +7215,7 @@ class TrainingPipeline:
             "gate_type": "branch_only",
             "c_analytic": float(self.lqr_box_artifacts.c_analytic),
             "C_S": float(self.lqr_box_artifacts.c_s),
-            "c_sigmoid_center": None,
-            "sample_cap": float(self.lqr_box_artifacts.c_sigmoid_center),
+            "sample_cap": float(self.lqr_box_artifacts.C_sample_cap),
             "c1_scale": float(cfg.c1_scale),
             "sharpness": None,
             "policy_loss": (
@@ -6923,6 +7224,7 @@ class TrainingPipeline:
                 "+ pi_lambda_decrease * ReLU(omega(f(x,pi_nn(x))) - (1-kappa)*omega(x)) "
                 "+ pi_lambda_control * weighted_MSE((pi_nn(x)-u_opt_grid)/(u_hi-u_lb))"
             ),
+            "policy_training_feasibility": feasibility_summary,
             "policy_label_selection_mode": "argmin",
             "policy_label_near_optimal_rel_tol": float(cfg.policy_label_near_optimal_rel_tol),
             "control_imitation_weighting": (
@@ -6984,7 +7286,7 @@ class TrainingPipeline:
         # Closed-loop omega can either copy original omega's embedded architecture
         # or train a fresh state-input value under the selected controller:
         #
-        #   f_cl(x) = f_sys(x, pi_branch(x))
+        #   f_cl(x) = f_sys(x, selected_training_controller(x))
         #   zubov residual = omega_cl(x) - omega_cl(f_cl(x))
         #                    - xi(x) * (1 - omega_cl(f_cl(x)))
         #
@@ -7004,10 +7306,9 @@ class TrainingPipeline:
         closed_loop_controller_mode = str(cfg.closed_loop_controller_mode).strip().lower()
         if closed_loop_controller_mode in {"nn", "neural", "neural_net", "saturated_nn", "tanh_nn"}:
             closed_loop_controller_mode = "nn"
-        if closed_loop_controller_mode not in {"nn", "lqr"}:
+        if closed_loop_controller_mode not in {"nn", "lqr", "tanh_blend"}:
             raise ValueError(
-                "closed_loop_controller_mode must be 'nn' or 'lqr'; blended/sigmoid "
-                "controllers are not part of the discontinuous-switch proof path, "
+                "closed_loop_controller_mode must be 'nn', 'lqr', or 'tanh_blend', "
                 f"got {cfg.closed_loop_controller_mode!r}."
             )
         counts = resolve_data_distribution_counts(self.system)
@@ -7032,6 +7333,13 @@ class TrainingPipeline:
         pi.eval()
         for param in pi.parameters():
             param.requires_grad_(False)
+
+        blend_c1 = None
+        if closed_loop_controller_mode == "tanh_blend":
+            blend_c1 = float(self.lqr_box_artifacts.c_analytic)
+            validate_blended_controller_artifacts(
+                pi, self.lqr_box_artifacts.P, self.lqr_box_artifacts.K, c1=blend_c1,
+            )
 
         original_omega = load_omeganet(
             omega_path,
@@ -7149,6 +7457,8 @@ class TrainingPipeline:
         print(f"  trajectory points      = {trajectory_states.shape[0]}")
         print(f"  constraint points      = {constraint_states.shape[0]}")
         print(f"  omega_cl controller    = {closed_loop_controller_mode}")
+        if blend_c1 is not None:
+            print(f"  blend midpoint c1      = {blend_c1:.9g} (c_analytic)")
         print(f"  optimized sublevel     = {cfg.closed_loop_dos_sublevel}")
         print(f"  decrease DOS gate      = {cfg.closed_loop_loss_dos_gate}")
         print(f"  horizon                = {cfg.closed_loop_horizon}")
@@ -7200,6 +7510,7 @@ class TrainingPipeline:
                         p_matrix,
                         horizon=cfg.closed_loop_horizon,
                         controller_mode=closed_loop_controller_mode,
+                        c1=blend_c1,
                         value_input_dim=omega_cl.input_dim,
                     )
                 label_batches.append(
@@ -7238,7 +7549,7 @@ class TrainingPipeline:
         def closed_loop_step(x: torch.Tensor) -> torch.Tensor:
             return self.system.dynamics(
                 x,
-                policy_control_for_mode(pi, x, closed_loop_controller_mode),
+                policy_control_for_mode(pi, x, closed_loop_controller_mode, c1=blend_c1),
             )
 
         optimizer = torch.optim.Adam(omega_cl.parameters(), lr=cfg.closed_loop_lr)
@@ -7392,7 +7703,7 @@ class TrainingPipeline:
             "P": self.lqr_box_artifacts.P.detach().cpu().numpy().astype(float).tolist(),
             "K": self.lqr_box_artifacts.K.detach().cpu().numpy().astype(float).tolist(),
             "c_analytic": float(self.lqr_box_artifacts.c_analytic),
-            "sample_cap": float(self.lqr_box_artifacts.c_sigmoid_center),
+            "sample_cap": float(self.lqr_box_artifacts.C_sample_cap),
             "C_S": float(self.lqr_box_artifacts.c_s),
             "zubov_alpha_scale": float(cfg.zubov_alpha_scale),
             "closed_loop_loss": {
@@ -7414,7 +7725,7 @@ class TrainingPipeline:
                 "optimized_sampling_sublevel": float(cfg.closed_loop_dos_sublevel),
                 "datasets_are_disjoint": True,
                 "kappa": float(cfg.kappa),
-                "controller_mode": closed_loop_controller_mode,
+                **closed_loop_controller_metadata(closed_loop_controller_mode, c1=blend_c1),
                 "omega_initialization": omega_initialization,
                 "closed_loop_initialize_from_original_omega": initialize_from_original_omega,
             },
@@ -7499,6 +7810,7 @@ class TrainingPipeline:
                 validation_states,
                 validation_source_ids,
                 controller_mode=closed_loop_controller_mode,
+                c1=blend_c1,
                 batch_size=int(cfg.closed_loop_validation_batch_size),
                 dos_gate=float(cfg.closed_loop_loss_dos_gate),
                 eps=float(self.system.verification.eps if self.system.verification is not None else 0.0),
@@ -7565,7 +7877,7 @@ class TrainingPipeline:
         )
         print(f"  X_v           = {self.system.verification.domain}")
         print(f"  c1 search gate = {self.lqr_box_artifacts.c_analytic:.9g} (eta-analytic)")
-        print(f"  sample cap = {self.lqr_box_artifacts.c_sigmoid_center:.9g}")
+        print(f"  sample cap = {self.lqr_box_artifacts.C_sample_cap:.9g}")
         print(f"  C_S            = {self.lqr_box_artifacts.c_s:.9g}")
         c2_hard_cap = min(
             float(self.lqr_box_artifacts.c_input),
@@ -7593,6 +7905,17 @@ class TrainingPipeline:
         )
 
         full_payload = asdict(result)
+        if cfg.quadratic_control_search_enabled:
+            quadratic_result = quadratic_control_grid_search(
+                self.system, p_matrix, c1=self.lqr_box_artifacts.c_analytic, device=self.device)
+            full_payload["quadratic_control_diagnostic"] = quadratic_result
+            if self.run_context is not None:
+                self.run_context.write_json("quadratic_control_search.json", quadratic_result)
+            else:
+                (artifact_dir / "quadratic_control_search.json").write_text(
+                    json.dumps(quadratic_result, indent=2, allow_nan=False), encoding="utf-8")
+            print(f"  empirical C_quad_opt = {quadratic_result['level']:.9g} "
+                  f"(limited by {quadratic_result['limited_by']})")
         verifier_payload = {
             "eps": float(result.eps),
             "c1": float(result.c1_raw),
@@ -7602,7 +7925,7 @@ class TrainingPipeline:
             "raw": {
                 "c1_search": result.c1_raw,
                 "c_analytic": float(self.lqr_box_artifacts.c_analytic),
-                "sample_cap": float(self.lqr_box_artifacts.c_sigmoid_center),
+                "sample_cap": float(self.lqr_box_artifacts.C_sample_cap),
                 "C_S": result.c_s,
                 "c2_cap": result.c2_cap,
                 "c2_cap_input": float(self.lqr_box_artifacts.c_input),
@@ -7792,7 +8115,7 @@ class TrainingPipeline:
                 omega_cl=omega_cl,
                 p_matrix=p_matrix,
                 c_analytic=self.lqr_box_artifacts.c_analytic,
-                c_sigmoid_center=self.lqr_box_artifacts.c_sigmoid_center,
+                C_sample_cap=self.lqr_box_artifacts.C_sample_cap,
                 c_s=self.lqr_box_artifacts.c_s,
                 thresholds=thresholds,
                 optimal_grid=optimal_grid,
@@ -7805,7 +8128,6 @@ class TrainingPipeline:
                 pi=pi,
                 p_matrix=p_matrix,
                 c_analytic=self.lqr_box_artifacts.c_analytic,
-                c_sigmoid_center=self.lqr_box_artifacts.c_sigmoid_center,
                 c_s=self.lqr_box_artifacts.c_s,
                 thresholds=thresholds,
                 optimal_grid=optimal_grid,
@@ -7827,7 +8149,7 @@ class TrainingPipeline:
         print(f"  omega checkpoint   = {omega_path}")
         print(f"  omega_cl checkpoint = {omega_cl_path}")
         print(f"  heatmap c_analytic  = {self.lqr_box_artifacts.c_analytic:.9g}")
-        print(f"  heatmap sample cap = {self.lqr_box_artifacts.c_sigmoid_center:.9g}")
+        print(f"  heatmap sample cap = {self.lqr_box_artifacts.C_sample_cap:.9g}")
         print(f"  heatmap C_S         = {self.lqr_box_artifacts.c_s:.9g}")
         print(f"  heatmap plot pairs  = {plot_pairs}")
         print(f"  thresholds         = {threshold_path if thresholds else 'systems.py verification config'}")

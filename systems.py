@@ -129,7 +129,7 @@ class TrainingConfig:
     reachability_expansion_factor: float = 1.25
     reachability_expansion_max_radius_scale: float = 100.0
     policy_label_dos_sublevel: float = 0.98
-    optimized_sampler_max_attempts: int = 100
+    optimized_sampler_max_attempts: int = 1000
     optimized_sampler_strict_sublevel: bool = False
     closed_loop_optimized_sampler_strict_sublevel: bool = False
     policy_label_cache_path: Optional[str] = None
@@ -177,9 +177,10 @@ class TrainingConfig:
     # Held-out closed-loop decrease diagnostics after omega_cl training.
     closed_loop_validation_points: int = 200_000
     closed_loop_validation_batch_size: int = 50_000
-    # Closed-loop omega is trained against the saturated NN branch. Verification
-    # separately checks the clamped LQR branch inside nu <= c2.
-    closed_loop_controller_mode: str = "nn"
+    # All systems default to the continuous NN/LQR blend for closed-loop training.
+    # Verification still uses separate NN and clamped-LQR branches at nu = c2.
+    # Explicit alternatives for comparison runs: "nn" or "lqr".
+    closed_loop_controller_mode: str = "tanh_blend"
     closed_loop_log_every: int = 500
     kappa: float = 1e-4
     boundary_diagnostic_points_per_face: int = 64
@@ -194,6 +195,14 @@ class TrainingConfig:
     threshold_search_c2_scale: Optional[float] = 0.90
     threshold_search_w1_scale: Optional[float] = 0.90
     threshold_search_w2_scale: Optional[float] = None
+    # Optional empirical quadratic CLF diagnostic; never a controller threshold.
+    quadratic_control_search_enabled: bool = False
+    quadratic_control_search_samples: Optional[int] = None  # Inherit threshold_search_samples.
+    quadratic_control_search_points_per_dim: int = 1001
+    quadratic_control_search_state_batch_size: int = 1024
+    quadratic_control_search_control_batch_size: int = 128
+    quadratic_control_search_scale: float = 0.99
+    quadratic_control_search_decrease_eps: float = 0.0  # Strict decrease; origin excluded.
 
 
 @dataclass(frozen=True)
@@ -355,6 +364,110 @@ def f_sys_cartpole(state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
     )
 
 
+def f_sys_nonlinear_integrator_4d(state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
+    """4D bounded-input unstable nonlinear double-integrator benchmark.
+
+    State layout is (p1, p2, v1, v2). The origin is an equilibrium under zero
+    control, but the positive stiffness terms make the open-loop origin
+    unstable. The smooth sinusoidal cross-coupling makes the system nonlinear
+    without introducing periodic state identifications or hidden rail limits.
+    """
+    dt = 0.01
+    coupling = 0.5
+    stiffness = 0.25
+
+    p1 = state[..., 0:1]
+    p2 = state[..., 1:2]
+    v1 = state[..., 2:3]
+    v2 = state[..., 3:4]
+    u1 = action[..., 0:1]
+    u2 = action[..., 1:2]
+
+    p1_next = p1 + dt * v1
+    p2_next = p2 + dt * v2
+    v1_next = v1 + dt * (u1 + stiffness * p1 + coupling * torch.sin(p2))
+    v2_next = v2 + dt * (u2 + stiffness * p2 + coupling * torch.sin(p1))
+    return torch.cat([p1_next, p2_next, v1_next, v2_next], dim=-1)
+
+
+def f_sys_acrobot(state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
+    """Ideal torque-limited Acrobot, forward-Euler discretized.
+
+    State layout is (theta1, theta2, omega1, omega2), centered at the upright
+    equilibrium. The physical first-link angle is pi + theta1, so the origin
+    with zero elbow torque is the unstable upright equilibrium.
+    """
+    dt = 0.002
+    gravity = 9.81
+    m1 = 0.5234602302310271
+    m2 = 0.6255677234174437
+    l1 = 0.2
+    lc1 = 0.2
+    lc2 = 0.25569305436052964
+    i1 = 0.031887199591513114
+    i2 = 0.05086984812807257
+    max_torque = 6.0
+
+    theta1 = state[..., 0:1]
+    theta2 = state[..., 1:2]
+    omega1 = state[..., 2:3]
+    omega2 = state[..., 3:4]
+    torque = torch.clamp(action[..., 0:1], min=-max_torque, max=max_torque)
+
+    cos_theta2 = torch.cos(theta2)
+    sin_theta2 = torch.sin(theta2)
+    coupling = m2 * l1 * lc2
+
+    m11 = i1 + i2 + m2 * l1 * l1 + 2.0 * coupling * cos_theta2
+    m12 = i2 + coupling * cos_theta2
+    m22 = torch.full_like(m11, i2)
+    determinant = m11 * m22 - m12 * m12
+
+    r1 = (
+        m1 * gravity * lc1 * torch.sin(theta1)
+        + m2 * gravity * (l1 * torch.sin(theta1) + lc2 * torch.sin(theta1 + theta2))
+        + 2.0 * coupling * sin_theta2 * omega1 * omega2
+        + coupling * sin_theta2 * omega2 * omega2
+    )
+    r2 = (
+        m2 * gravity * lc2 * torch.sin(theta1 + theta2)
+        - coupling * sin_theta2 * omega1 * omega1
+        + torque
+    )
+
+    omega1_dot = (m22 * r1 - m12 * r2) / determinant
+    omega2_dot = (-m12 * r1 + m11 * r2) / determinant
+
+    return torch.cat(
+        [
+            theta1 + dt * omega1,
+            theta2 + dt * omega2,
+            omega1 + dt * omega1_dot,
+            omega2 + dt * omega2_dot,
+        ],
+        dim=-1,
+    )
+
+
+def f_sys_radial_clf_2d(state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
+    """Euler step for a rotating oscillator with bounded radial growth.
+
+    x_dot = (1 + (u-2)/(1+||x||^2)) x + J x, |u| <= 2, dt = 0.05.
+    The minimum squared successor radius is
+    Gamma(s) = s * ((1.05 - 0.2/(1+s))^2 + 0.05^2), attained at u=-2.
+    Gamma is increasing on s>=0, giving the radial CLF sufficient condition
+    with the pipeline's isotropic DARE P and quadratic stage cost.
+    B=0 at the origin: A is Schur, K=0, and control enlarges the local basin.
+    """
+    x1 = state[..., 0:1]
+    x2 = state[..., 1:2]
+    growth = 1.0 + (action[..., 0:1] - 2.0) / (1.0 + x1.square() + x2.square())
+    return torch.cat([
+        x1 + 0.05 * (growth * x1 - x2),
+        x2 + 0.05 * (x1 + growth * x2),
+    ], dim=-1)
+
+
 def f_sys_van_der_pol(state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
     """Controlled Van der Pol oscillator, discretized by forward Euler.
 
@@ -508,8 +621,8 @@ SYSTEMS: Dict[str, SystemSpec] = {
                     closed_loop_full_pass_epochs=True,
                     closed_loop_epochs=50,
                     closed_loop_lambda_zubov=0.0,
-                    closed_loop_data_target="omega_orig",
-                    closed_loop_anchor_filter="omega_orig_nonviolating",
+                    closed_loop_data_target="trajectory",
+                    closed_loop_anchor_filter="none",
                     closed_loop_lambda_data=0.01,
                     closed_loop_lambda_decrease=10.0,
                     closed_loop_lambda_range=0.0,
@@ -569,30 +682,31 @@ SYSTEMS: Dict[str, SystemSpec] = {
                     pi_hidden_sizes=(64, 64,64,64),
                     omega_label_batch_size=1_000,
                     omega_batch_size=100_000,
-                    omega_full_pass_epochs=True,
-                    omega_epochs=40,
+                    omega_full_pass_epochs=False,
+                    omega_epochs=3000,
                     omega_lambda_data=0.01,
                     kappa=1e-4,
                     omega_lambda_bellman=1.0,
                     omega_lambda_boundary=0.01,
-                    pi_lambda_control=1e-5,
+                    pi_lambda_control=1e-6,
                     pi_batch_size=100_000,
                     pi_lambda_decrease=0.0,
                     pi_full_pass_epochs=True,
-                    pi_epochs=30,
-                    closed_loop_hidden_sizes=(64, 64, 64,64,64),
+                    pi_epochs=10,
+                    closed_loop_hidden_sizes=(64, 64, 64, 64),
                     closed_loop_train_batch_size=100_000,
-                    closed_loop_full_pass_epochs=True,
-                    closed_loop_epochs=40,
+                    closed_loop_full_pass_epochs=False,
+                    closed_loop_epochs=3000,
                     closed_loop_lambda_data=0.01,
-                    closed_loop_lambda_zubov=0.0,
-                    closed_loop_data_target="omega_orig",
-                    closed_loop_anchor_filter="omega_orig_nonviolating",
+                    closed_loop_lambda_zubov=0.01,
+                    closed_loop_data_target="trajectory",
+                    closed_loop_anchor_filter="none",
                     closed_loop_lambda_decrease=30.0,
                     closed_loop_lambda_range=0.0,
                     closed_loop_lambda_boundary=0.0,
                     plot_pairs =((0,1),(1,2),(0,2)),
-                    threshold_search_c2_scale=0.99,
+                    threshold_search_samples=64_000_000,
+                    threshold_search_c2_scale=0.98,
                     threshold_search_w1_scale=0.99
                 ),
         verification=VerificationConfig(
@@ -614,31 +728,421 @@ SYSTEMS: Dict[str, SystemSpec] = {
         local_decrease=LocalDecreaseConfig(box_radii=(0.4, 0.4, 0.4, 0.4), eta_bound=(0.0, 0.0, 0.02, 0.08), epsilon=1e-07, source='conservative cart-pole Hessian envelope over the configured local box'),
         checkpoints=CheckpointNames(pi='cartpole_pi.pt', omega='cartpole_omega.pt', omega_closed_loop='cartpole_omegaCL.pt', pi_script='cartpole_pi_script.pt', omega_script='cartpole_omega_script.pt', omega_closed_loop_script='cartpole_omegaCL_script.pt', pi_onnx='cartpole_pi.onnx', omega_onnx='cartpole_omega.onnx', omega_closed_loop_onnx='cartpole_omegaCL.onnx'),
         training=TrainingConfig(
-                    q_scale=3e-4,
-                    r_scale=1e-3,
+                    q_scale=3e-1,
+                    r_scale=1e-1,
+                    reachability_expansion_max_radius_scale=16.0,
+                    zubov_alpha_scale=0.01,
+                    data_profile=DataDistributionProfile(
+                        base_points_per_dim=1000,
+                        base_exponent=None,
+                        base_reference_dim=2,
+                        base_dimension_growth=2.0,
+                        global_scale=0.25,
+                        omega_label_total_ratio=5e-2,
+                        omega_label_dimension_scale_base=1.0,
+                        omega_label_ellipse_fraction=0.0,
+                        omega_label_uniform_fraction=1.0,
+                        omega_collocation_total_ratio=0.5,
+                        omega_collocation_ellipse_fraction=0.0,
+                        omega_collocation_uniform_fraction=1.0,
+                        policy_total_ratio=0.25,
+                        policy_dimension_scale_base=1.0,
+                        policy_ellipse_fraction=0.0,
+                        policy_uniform_fraction=0.5,
+                        policy_gd_fraction=0.5,
+                        closed_loop_trajectory_total_ratio=1e-2,
+                        closed_loop_trajectory_dimension_scale_base=1.0,
+                        closed_loop_trajectory_ellipse_fraction=0.0,
+                        closed_loop_trajectory_uniform_fraction=1.0,
+                        closed_loop_trajectory_gd_fraction=0.0,
+                        closed_loop_constraint_total_ratio=1.0,
+                        closed_loop_constraint_ellipse_fraction=0.0,
+                        closed_loop_constraint_uniform_fraction=1.0,
+                        closed_loop_constraint_gd_fraction=0.0,
+                    ),
                     omega_hidden_sizes=(64, 64, 64, 64, 64, 64),
-                    pi_hidden_sizes=(32, 32, 32, 32, 32),
+                    pi_hidden_sizes=(96, 96, 96, 96),
+                    pi_activation="relu",
                     omega_lambda_data=0.01,
                     omega_lambda_bellman=1.0,
-                    omega_lambda_boundary=0.01,
-                    pi_lambda_control=1e-6,
+                    omega_lambda_boundary=0.1,
+                    omega_batch_size=50_000,
+                    omega_label_batch_size=64,
+                    omega_rollouts_per_state=3000,
+                    omega_full_pass_epochs=False,
+                    omega_epochs=3000,
+                    pi_lambda_control=1e-5,
+                    pi_batch_size=50_000,
+                    pi_full_pass_epochs=True,
+                    pi_epochs=30,
+                    pi_lambda_decrease=10.0,
                     closed_loop_hidden_sizes=(64, 64, 64, 64, 64, 64),
-                    closed_loop_lambda_data=0.01,
-                    closed_loop_lambda_decrease=10.0,
-                    closed_loop_lambda_range=0.01,
+                    closed_loop_train_batch_size=50_000,
+                    closed_loop_full_pass_epochs=False,
+                    closed_loop_epochs=3000,
+                    closed_loop_lambda_zubov=1.0,
+                    closed_loop_data_target="trajectory",
+                    closed_loop_anchor_filter="none",
+                    closed_loop_lambda_data=0.1,
+                    closed_loop_lambda_decrease=100.0,
+                    closed_loop_lambda_range=0.0,
+                    closed_loop_lambda_boundary=0.01,
+                    policy_label_mask_out_of_domain_successors=True,
+                    plot_pairs=((0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)),
+                    threshold_search_c2_scale=0.90,
+                    threshold_search_w1_scale=0.90,
                 ),
         verification=VerificationConfig(
-                    domain=((-0.4, 0.4), (-0.4, 0.4), (-0.4, 0.4), (-0.4, 0.4)),
-                    eps=1e-08,
-                ),
+                    domain=((-1.0, 1.0), (-1.0, 1.0), (-1.0, 1.0), (-1.0, 1.0)),
+                    eps=1e-09,
+        ),
         state_labels=('cart_position', 'pole_angle', 'cart_velocity', 'pole_angular_velocity'),
+    ),
+    'nonlinear_integrator_4d': SystemSpec(
+        name='nonlinear_integrator_4d',
+        n_dim=4,
+        u_dim=2,
+        x_lb=(-2.0, -2.0, -2.0, -2.0),
+        x_hi=(2.0, 2.0, 2.0, 2.0),
+        u_lb=(-1.0, -1.0),
+        u_hi=(1.0, 1.0),
+        dt=0.01,
+        dynamics=f_sys_nonlinear_integrator_4d,
+        local_decrease=LocalDecreaseConfig(
+            box_radii=(1.0, 1.0, 1.0, 1.0),
+            eta_bound=(0.0, 0.0, 0.012, 0.012),
+            epsilon=1e-07,
+            source='conservative analytic sine Hessian envelope for a=0.5, stiffness=0.25, dt=0.01 over |p|<=1',
+        ),
+        checkpoints=CheckpointNames(
+            pi='nonlinear_integrator_4d_pi.pt',
+            omega='nonlinear_integrator_4d_omega.pt',
+            omega_closed_loop='nonlinear_integrator_4d_omegaCL.pt',
+            pi_script='nonlinear_integrator_4d_pi_script.pt',
+            omega_script='nonlinear_integrator_4d_omega_script.pt',
+            omega_closed_loop_script='nonlinear_integrator_4d_omegaCL_script.pt',
+            pi_onnx='nonlinear_integrator_4d_pi.onnx',
+            omega_onnx='nonlinear_integrator_4d_omega.onnx',
+            omega_closed_loop_onnx='nonlinear_integrator_4d_omegaCL.onnx',
+        ),
+        training=TrainingConfig(
+            q_scale=1e-3,
+            r_scale=1e-3,
+            omega_rollout_horizon=100,
+            boundary_diagnostic_horizon=100,
+            closed_loop_horizon=100,
+            data_profile=DataDistributionProfile(
+                base_points_per_dim=1000,
+                base_exponent=None,
+                base_reference_dim=2,
+                base_dimension_growth=2.0,
+                global_scale=1.0,
+                omega_label_total_ratio=4e-3,
+                omega_label_dimension_scale_base=1.0,
+                omega_label_ellipse_fraction=0.2,
+                omega_label_uniform_fraction=0.8,
+                omega_collocation_total_ratio=1.0,
+                omega_collocation_ellipse_fraction=0.2,
+                omega_collocation_uniform_fraction=0.8,
+                policy_total_ratio=4e-2,
+                policy_dimension_scale_base=1.0,
+                policy_ellipse_fraction=0.0,
+                policy_uniform_fraction=0.3,
+                policy_gd_fraction=0.7,
+                closed_loop_trajectory_total_ratio=4e-2,
+                closed_loop_trajectory_dimension_scale_base=1.0,
+                closed_loop_trajectory_ellipse_fraction=0.0,
+                closed_loop_trajectory_uniform_fraction=0.3,
+                closed_loop_trajectory_gd_fraction=0.70,
+                closed_loop_constraint_total_ratio=1.0,
+                closed_loop_constraint_ellipse_fraction=0.0,
+                closed_loop_constraint_uniform_fraction=0.3,
+                closed_loop_constraint_gd_fraction=0.7,
+            ),
+            omega_hidden_sizes=(64, 64, 64, 64),
+            omega_label_batch_size=1_000,
+            quadratic_control_search_points_per_dim=21,
+            omega_batch_size=50_000,
+            omega_full_pass_epochs=False,
+            omega_epochs=3000,
+            omega_lambda_data=0.01,
+            omega_lambda_bellman=1.0,
+            omega_lambda_boundary=0.01,
+            pi_hidden_sizes=(96, 96, 96, 96, 96, 96),
+            pi_activation="relu",
+            pi_lambda_control=1e-5,
+            pi_lambda_decrease=0.0,
+            pi_batch_size=50_000,
+            pi_full_pass_epochs=True,
+            pi_epochs=30,
+            control_grid_points=31,
+            control_grid_batch_size=512,
+            closed_loop_hidden_sizes=(64, 64, 64, 64),
+            closed_loop_train_batch_size=50_000,
+            closed_loop_full_pass_epochs=False,
+            closed_loop_epochs=3000,
+            closed_loop_lambda_zubov=0.01,
+            closed_loop_data_target="trajectory",
+            closed_loop_anchor_filter="none",
+            closed_loop_lambda_data=0.01,
+            closed_loop_lambda_decrease=300.0,
+            closed_loop_lambda_range=0.0,
+            closed_loop_lambda_boundary=0.0,
+            plot_pairs=((0, 1), (0, 2), (1, 3), (2, 3)),
+            threshold_search_samples=500_000_000,
+            threshold_search_c2_scale=0.8,
+            threshold_search_w1_scale=0.9,
+            threshold_search_w2_scale=0.8,
+            quadratic_control_search_enabled=True,
+            quadratic_control_search_control_batch_size=128,
+            quadratic_control_search_samples=1_000_000,
+            quadratic_control_search_decrease_eps=1e-8
+        ),
+        verification=VerificationConfig(
+            domain=((-2.0, 2.0), (-2.0, 2.0), (-2.0, 2.0), (-2.0, 2.0)),
+            eps=1e-08,
+        ),
+        state_labels=('p1', 'p2', 'v1', 'v2'),
+    ),
+    'acrobot': SystemSpec(
+        name='acrobot',
+        n_dim=4,
+        u_dim=1,
+        # PLACEHOLDER domain: broad enough to include downward-facing first-link
+        # states near theta1=+-pi, but not yet tuned against sampling cost or
+        # verification behavior.
+        x_lb=(-math.pi/4, -math.pi/4, -math.pi/4, -math.pi/4),
+        x_hi=(math.pi/4, math.pi/4, math.pi/4, math.pi/4),
+        u_lb=(-4.0,),
+        u_hi=(4.0,),
+        dt=0.002,
+        dynamics=f_sys_acrobot,
+        local_decrease=LocalDecreaseConfig(
+            # PLACEHOLDER local box and eta_bound: the Acrobot acceleration map
+            # contains M(theta)^-1, so this needs a dedicated analytic or
+            # interval Hessian bound before the local c1 certificate should be
+            # treated as meaningful.
+            box_radii=(0.25, 0.25, 0.5, 0.5),
+            eta_bound=(0.0, 0.0, 0.2, 1.0),
+            epsilon=1e-08,
+            source='PLACEHOLDER: finite Acrobot eta bound for implementation bring-up only; derive before certification claims',
+        ),
+        checkpoints=CheckpointNames(
+            pi='acrobot_pi.pt',
+            omega='acrobot_omega.pt',
+            omega_closed_loop='acrobot_omegaCL.pt',
+            pi_script='acrobot_pi_script.pt',
+            omega_script='acrobot_omega_script.pt',
+            omega_closed_loop_script='acrobot_omegaCL_script.pt',
+            pi_onnx='acrobot_pi.onnx',
+            omega_onnx='acrobot_omega.onnx',
+            omega_closed_loop_onnx='acrobot_omegaCL.onnx',
+        ),
+        training=TrainingConfig(
+            # Near-pi 6x128 original: data/residual/origin-BC = 1.0/0.1/0.01.
+            seed=103289,
+            q_scale=0.01,
+            r_scale=0.01,
+            c1_scale=1.0,
+            lqr_decrease_grid_points_per_dim=101,
+            lqr_decrease_grid_batch_size=50000,
+            zubov_alpha_scale=1.0,
+            omega_hidden_sizes=(128, 128, 128, 128, 128, 128),
+            pi_hidden_sizes=(64, 64, 64, 64, 64, 64),
+            pi_activation="tanh",
+            omega_rollout_horizon=100,
+            omega_rollouts_per_state=3000,
+            data_profile=DataDistributionProfile(
+                base_points_per_dim=1000,
+                base_exponent=None,
+                base_reference_dim=2,
+                base_dimension_growth=2,
+                global_scale=1,
+                omega_label_total_ratio=0.025,
+                omega_label_dimension_scale_base=1,
+                omega_label_ellipse_fraction=0,
+                omega_label_uniform_fraction=1,
+                omega_collocation_total_ratio=1,
+                omega_collocation_ellipse_fraction=0,
+                omega_collocation_uniform_fraction=1,
+                policy_total_ratio=0.2,
+                policy_dimension_scale_base=1,
+                policy_ellipse_fraction=0,
+                policy_uniform_fraction=0.3,
+                policy_gd_fraction=0.7,
+                closed_loop_trajectory_total_ratio=0.025,
+                closed_loop_trajectory_dimension_scale_base=1,
+                closed_loop_trajectory_ellipse_fraction=0,
+                closed_loop_trajectory_uniform_fraction=0.3,
+                closed_loop_trajectory_gd_fraction=0.7,
+                closed_loop_constraint_total_ratio=2,
+                closed_loop_constraint_ellipse_fraction=0,
+                closed_loop_constraint_uniform_fraction=0.3,
+                closed_loop_constraint_gd_fraction=0.7,
+            ),
+            omega_boundary_noise_std=1.2,
+            omega_label_batch_size=128,
+            omega_batch_size=100000,
+            omega_full_pass_epochs=False,
+            omega_epochs=6000,
+            omega_lr=0.001,
+            omega_lambda_data=0.1,
+            omega_lambda_bellman=1.0,
+            omega_lambda_boundary=0.1,
+            control_grid_points=513,
+            control_grid_batch_size=2000,
+            domain_expansion_strategy="reachability_stepwise_min",
+            reachability_expansion_max_iters=100,
+            reachability_expansion_factor=1.1,
+            reachability_expansion_max_radius_scale=6,
+            policy_label_dos_sublevel=0.98,
+            optimized_sampler_max_attempts=1000,
+            optimized_sampler_strict_sublevel=False,
+            closed_loop_optimized_sampler_strict_sublevel=False,
+            policy_label_cache_path=None,
+            pi_epochs=20,
+            pi_lr=0.01,
+            pi_lr_min=0.00001,
+            pi_batch_size=100000,
+            pi_train_max_points=None,
+            pi_full_pass_epochs=True,
+            pi_lambda_control=0.000001,
+            pi_lambda_decrease=0,
+            sharpness=100,
+            grad_clip_norm=5,
+            pi_log_every=200,
+            pi_eval_points=2000,
+            pi_plot_points=5000,
+            policy_decrease_report_points=200000,
+            policy_decrease_report_batch_size=50000,
+            policy_label_use_confidence_weight=False,
+            policy_label_mask_out_of_domain_successors=True,
+            policy_label_near_optimal_rel_tol=0.01,
+            diagnostic_plot_grid_points=151,
+            policy_label_gap_near_optimal_rel_tol=0.01,
+            plot_pairs=((0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)),
+            closed_loop_hidden_sizes=(128, 128, 128, 128, 128, 128),
+            closed_loop_initialize_from_original_omega=True,
+            closed_loop_dos_sublevel=0.98,
+            closed_loop_horizon=100,
+            closed_loop_epochs=3000,
+            closed_loop_label_batch_size=50000,
+            closed_loop_train_batch_size=100000,
+            closed_loop_full_pass_epochs=False,
+            closed_loop_lr=0.001,
+            closed_loop_lambda_zubov=0.1,
+            closed_loop_data_target="trajectory",
+            closed_loop_anchor_filter="none",
+            closed_loop_lambda_data=0.01,
+            closed_loop_lambda_decrease=100,
+            closed_loop_lambda_range=0,
+            closed_loop_lambda_boundary=0.1,
+            closed_loop_loss_dos_gate=0.98,
+            closed_loop_validation_points=200000,
+            closed_loop_validation_batch_size=50000,
+            closed_loop_log_every=500,
+            kappa=0.0001,
+            boundary_diagnostic_points_per_face=64,
+            boundary_diagnostic_horizon=100,
+            boundary_diagnostic_rollouts_per_state=20000,
+            boundary_diagnostic_batch_size=32,
+            boundary_diagnostic_w_threshold=0.99,
+            threshold_search_samples=64000000,
+            threshold_search_batch_size=20000,
+            threshold_search_scale=0.98,
+            threshold_search_c2_scale=0.98,
+            threshold_search_w1_scale=0.99,
+            threshold_search_w2_scale=None,
+        ),
+        verification=VerificationConfig(
+                    # PLACEHOLDER verification domain: start near the upright
+                    # equilibrium until the Acrobot eta/local-domain constants
+                    # are derived and the larger DOS experiments are designed.
+                    domain=((-0.8, 0.8), (-0.8, 0.8), (-2.0, 2.0), (-2.0, 2.0)),
+                    eps=1e-09,
+                ),
+        state_labels=('theta1', 'theta2', 'omega1', 'omega2'),
+    ),
+    'radial_clf_2d': SystemSpec(
+        name='radial_clf_2d',
+        n_dim=2,
+        u_dim=1,
+        # The exact controlled DOS has radius about 1.704, inside this box.
+        x_lb=(-2.0, -2.0),
+        x_hi=(2.0, 2.0),
+        u_lb=(-2.0,),
+        u_hi=(2.0,),
+        dt=0.05,
+        dynamics=f_sys_radial_clf_2d,
+        local_decrease=LocalDecreaseConfig(
+            box_radii=(0.5, 0.5),
+            # |2*dt*x_i*||x||^2/(1+||x||^2)| <= (eta_i/2)*||x||^2.
+            eta_bound=(0.1, 0.1),
+            epsilon=1e-7,
+            source='analytic rational remainder bound on [-0.5,0.5]^2 with K=0',
+        ),
+        checkpoints=CheckpointNames(
+            pi='radial_clf_2d_pi.pt', omega='radial_clf_2d_omega.pt',
+            omega_closed_loop='radial_clf_2d_omegaCL.pt',
+            pi_script='radial_clf_2d_pi_script.pt',
+            omega_script='radial_clf_2d_omega_script.pt',
+            omega_closed_loop_script='radial_clf_2d_omegaCL_script.pt',
+            pi_onnx='radial_clf_2d_pi.onnx', omega_onnx='radial_clf_2d_omega.onnx',
+            omega_closed_loop_onnx='radial_clf_2d_omegaCL.onnx',
+        ),
+        training=TrainingConfig(
+            q_scale=0.1, r_scale=1, zubov_alpha_scale=1.0,
+            data_profile=DataDistributionProfile(
+                global_scale=1.0,
+                omega_label_total_ratio=0.01,
+                omega_label_ellipse_fraction=0.0, omega_label_uniform_fraction=1.0,
+                omega_collocation_ellipse_fraction=0.0,
+                omega_collocation_uniform_fraction=1.0,
+                policy_total_ratio=1.0,
+                policy_ellipse_fraction=0.0, policy_uniform_fraction=0.2,
+                policy_gd_fraction=0.8,
+                closed_loop_trajectory_total_ratio=0.01,
+                closed_loop_trajectory_ellipse_fraction=0.0,
+                closed_loop_trajectory_uniform_fraction=0.2,
+                closed_loop_trajectory_gd_fraction=0.8,
+                closed_loop_constraint_ellipse_fraction=0.0,
+                closed_loop_constraint_uniform_fraction=0.2,
+                closed_loop_constraint_gd_fraction=0.8,
+            ),
+            omega_hidden_sizes=(20, 20, 20, 20, 20, 20, 20),
+            closed_loop_hidden_sizes=(20, 20, 20, 20, 20, 20, 20),
+            pi_hidden_sizes=(60, 60, 60, 60),
+            # The known whole DOS is inside the initial box; no expansion needed.
+            domain_expansion_strategy='defer',
+            quadratic_control_search_control_batch_size=100,
+            quadratic_control_search_enabled=True,
+            omega_rollout_horizon=150, closed_loop_horizon=150,
+            boundary_diagnostic_horizon=150,
+            omega_label_batch_size=128,
+            omega_batch_size=50_000, omega_full_pass_epochs=False,
+            omega_epochs=3000, omega_lambda_data=0.01,
+            omega_lambda_bellman=1.0, omega_lambda_boundary=0.01,
+            control_grid_points=501,
+            pi_batch_size=50_000, pi_epochs=30, pi_full_pass_epochs=True,
+            pi_lambda_control=1e-8, pi_lambda_decrease=0.0,
+            closed_loop_train_batch_size=50_000,
+            closed_loop_full_pass_epochs=False, closed_loop_epochs=3000,
+            closed_loop_lambda_zubov=0.01, closed_loop_lambda_data=0.01,
+            closed_loop_lambda_decrease=30.0, closed_loop_lambda_range=0.0,
+            closed_loop_lambda_boundary=0.0,
+            closed_loop_data_target='trajectory', closed_loop_anchor_filter='none',
+            threshold_search_w1_scale=0.95,
+            
+        ),
+        verification=VerificationConfig(domain=((-2.0, 2.0), (-2.0, 2.0)), eps=1e-8),
+        state_labels=('x1', 'x2'),
     ),
     'van_der_pol': SystemSpec(
         name='van_der_pol',
         n_dim=2,
         u_dim=1,
-        x_lb=(-5.0, -5.0),
-        x_hi=(5.0, 5.0),
+        x_lb=(-1.0, -1.0),
+        x_hi=(1.0, 1.0),
         u_lb=(-1.0,),
         u_hi=(1.0,),
         dt=0.01,
@@ -646,58 +1150,60 @@ SYSTEMS: Dict[str, SystemSpec] = {
         local_decrease=LocalDecreaseConfig(box_radii=(0.5, 0.5), eta_bound=(0.0, 0.02), epsilon=1e-07),
         checkpoints=CheckpointNames(pi='vanderpol_pi.pt', omega='vanderpol_omega.pt', omega_closed_loop='vanderpol_omegaCL.pt', pi_script='vanderpol_pi_script.pt', omega_script='vanderpol_omega_script.pt', omega_closed_loop_script='vanderpol_omegaCL_script.pt', pi_onnx='vanderpol_pi.onnx', omega_onnx='vanderpol_omega.onnx', omega_closed_loop_onnx='vanderpol_omegaCL.onnx'),
         training=TrainingConfig(
-                    q_scale=1e-4,
-                    r_scale=1e-3,
+                    q_scale=0.1,
+                    r_scale=1,
+                    zubov_alpha_scale=1,
                     data_profile=DataDistributionProfile(
                         base_points_per_dim=1000,
                         base_exponent=None,
                         base_reference_dim=2,
                         base_dimension_growth=2.0,
-                        global_scale=1.0,
+                        global_scale=10.0,
                         omega_label_total_ratio=1e-3,
                         omega_label_dimension_scale_base=1.0,
-                        omega_label_ellipse_fraction=0.2,
-                        omega_label_uniform_fraction=0.8,
+                        omega_label_ellipse_fraction=0.0,
+                        omega_label_uniform_fraction=1.0,
                         omega_collocation_total_ratio=1.0,
-                        omega_collocation_ellipse_fraction=0.2,
-                        omega_collocation_uniform_fraction=0.8,
-                        policy_total_ratio=1.0,
+                        omega_collocation_ellipse_fraction=0.0,
+                        omega_collocation_uniform_fraction=1.0,
+                        policy_total_ratio=0.1,
                         policy_dimension_scale_base=1.0,
-                        policy_ellipse_fraction=0.2,
-                        policy_uniform_fraction=0.2,
-                        policy_gd_fraction=0.6,
-                        closed_loop_trajectory_total_ratio=1e-2,
+                        policy_ellipse_fraction=0.0,
+                        policy_uniform_fraction=0.5,
+                        policy_gd_fraction=0.5,
+                        closed_loop_trajectory_total_ratio=1e-3,
                         closed_loop_trajectory_dimension_scale_base=1.0,
-                        closed_loop_trajectory_ellipse_fraction=0.2,
-                        closed_loop_trajectory_uniform_fraction=0.2,
-                        closed_loop_trajectory_gd_fraction=0.6,
+                        closed_loop_trajectory_ellipse_fraction=0.0,
+                        closed_loop_trajectory_uniform_fraction=0.5,
+                        closed_loop_trajectory_gd_fraction=0.5,
                         closed_loop_constraint_total_ratio=1.0,
-                        closed_loop_constraint_ellipse_fraction=0.2,
-                        closed_loop_constraint_uniform_fraction=0.2,
-                        closed_loop_constraint_gd_fraction=0.6,
+                        closed_loop_constraint_ellipse_fraction=0.0,
+                        closed_loop_constraint_uniform_fraction=0.5,
+                        closed_loop_constraint_gd_fraction=0.5,
                     ),
                     omega_hidden_sizes=(20, 20, 20, 20, 20,20,20),
                     pi_hidden_sizes=(60, 60,60,60),
                     pi_lambda_control=1e-8,
                     omega_batch_size=50_000,
-                    omega_rollout_horizon=75,
-                    closed_loop_horizon=75,
-                    omega_full_pass_epochs=True,
-                    omega_epochs=50,
+                    omega_rollout_horizon=50,
+                    closed_loop_horizon=50,
+                    boundary_diagnostic_horizon=50,
+                    omega_full_pass_epochs=False,
+                    omega_epochs=3000,
                     omega_lambda_data=0.01,
                     omega_lambda_bellman=1.0,
-                    omega_lambda_boundary=0.01,
-                    pi_batch_size=50_000,
+                    omega_lambda_boundary=0.1,
+                    pi_batch_size=10_000,
                     pi_full_pass_epochs=True,
                     pi_epochs=30,
                     pi_lambda_decrease=0.0,
                     closed_loop_hidden_sizes=(20,20,20,20,20,20,20),
                     closed_loop_train_batch_size=50_000,
-                    closed_loop_full_pass_epochs=True,
-                    closed_loop_epochs=50,
-                    closed_loop_lambda_zubov=0.0,
-                    closed_loop_data_target="omega_orig",
-                    closed_loop_anchor_filter="omega_orig_nonviolating",
+                    closed_loop_full_pass_epochs=False,
+                    closed_loop_epochs=3000,
+                    closed_loop_lambda_zubov=0.01,
+                    closed_loop_data_target="trajectory",
+                    closed_loop_anchor_filter="none",
                     closed_loop_lambda_data=0.01,
                     closed_loop_lambda_decrease=30.0,
                     closed_loop_lambda_range=0.0,
@@ -722,13 +1228,66 @@ SYSTEMS: Dict[str, SystemSpec] = {
         dynamics=f_sys_path_tracking,
         local_decrease=LocalDecreaseConfig(box_radii=(2.0, 2.0), eta_bound=(0.02, 0.005), epsilon=1e-07, source='analytic path-tracking Hessian bound with c=R/v=5'),
         checkpoints=CheckpointNames(pi='path_tracking_bigtorque_pi.pt', omega='path_tracking_bigtorque_omega.pt', omega_closed_loop='path_tracking_bigtorque_omegaCL.pt', pi_script='path_tracking_bigtorque_pi_script.pt', omega_script='path_tracking_bigtorque_omega_script.pt', omega_closed_loop_script='path_tracking_bigtorque_omegaCL_script.pt', pi_onnx='path_tracking_bigtorque_pi.onnx', omega_onnx='path_tracking_bigtorque_omega.onnx', omega_closed_loop_onnx='path_tracking_bigtorque_omegaCL.onnx'),
-        training=TrainingConfig(
-                    q_scale=0.01,
-                    r_scale=0.01,
-                    omega_hidden_sizes=(40, 40),
-                    pi_hidden_sizes=(10, 10),
-                    closed_loop_hidden_sizes=(40, 40),
-                ),
+        training=TrainingConfig(q_scale=1,
+                            r_scale=1,
+                            zubov_alpha_scale=0.001,
+                            data_profile=DataDistributionProfile(
+                                base_points_per_dim=1000,
+                                base_exponent=None,
+                                base_reference_dim=2,
+                                base_dimension_growth=2.0,
+                                global_scale=1.0,
+                                omega_label_total_ratio=1e-3,
+                                omega_label_dimension_scale_base=1.0,
+                                omega_label_ellipse_fraction=0.0,
+                                omega_label_uniform_fraction=1.0,
+                                omega_collocation_total_ratio=1.0,
+                                omega_collocation_ellipse_fraction=0.0,
+                                omega_collocation_uniform_fraction=1.0,
+                                policy_total_ratio=0.1,
+                                policy_dimension_scale_base=1.0,
+                                policy_ellipse_fraction=0.0,
+                                policy_uniform_fraction=0.5,
+                                policy_gd_fraction=0.5,
+                                closed_loop_trajectory_total_ratio=5e-3,
+                                closed_loop_trajectory_dimension_scale_base=1.0,
+                                closed_loop_trajectory_ellipse_fraction=0.0,
+                                closed_loop_trajectory_uniform_fraction=0.5,
+                                closed_loop_trajectory_gd_fraction=0.5,
+                                closed_loop_constraint_total_ratio=1.0,
+                                closed_loop_constraint_ellipse_fraction=0.0,
+                                closed_loop_constraint_uniform_fraction=0.5,
+                                closed_loop_constraint_gd_fraction=0.5,
+                            ),
+                            omega_hidden_sizes=(256,256,256,256),
+                            pi_hidden_sizes=(256,256,256,256,256),
+                            pi_lambda_control=1e-8,
+                            omega_batch_size=5_000,
+                            omega_rollout_horizon=60,
+                            closed_loop_horizon=60,
+                            boundary_diagnostic_horizon=60,
+                            omega_full_pass_epochs=False,
+                            omega_epochs=5000,
+                            omega_lambda_data=0.01,
+                            omega_lambda_bellman=1.0,
+                            omega_lambda_boundary=0.1,
+                            pi_batch_size=10_000,
+                            pi_full_pass_epochs=True,
+                            pi_epochs=100,
+                            pi_lambda_decrease=0.0,
+                            closed_loop_hidden_sizes=(256,256,256,256),
+                            closed_loop_train_batch_size=100_000,
+                            closed_loop_full_pass_epochs=False,
+                            closed_loop_epochs=5000,
+                            closed_loop_lambda_zubov=0.01,
+                            closed_loop_data_target="trajectory",
+                            closed_loop_anchor_filter="none",
+                            closed_loop_lambda_data=0.1,
+                            closed_loop_lambda_decrease=500.0,
+                            closed_loop_lambda_range=0.0,
+                            closed_loop_lambda_boundary=0.0,
+                            threshold_search_w1_scale=0.95
+                        ),
         verification=VerificationConfig(
                     domain=((-2.0, 2.0), (-2.0, 2.0)),
                     eps=1e-06,
@@ -748,8 +1307,8 @@ SYSTEMS: Dict[str, SystemSpec] = {
         local_decrease=LocalDecreaseConfig(box_radii=(2.0, 2.0), eta_bound=(0.02, 0.005), epsilon=1e-07, source='analytic path-tracking Hessian bound with c=R/v=5'),
         checkpoints=CheckpointNames(pi='path_tracking_smalltorque_pi.pt', omega='path_tracking_smalltorque_omega.pt', omega_closed_loop='path_tracking_smalltorque_omegaCL.pt', pi_script='path_tracking_smalltorque_pi_script.pt', omega_script='path_tracking_smalltorque_omega_script.pt', omega_closed_loop_script='path_tracking_smalltorque_omegaCL_script.pt', pi_onnx='path_tracking_smalltorque_pi.onnx', omega_onnx='path_tracking_smalltorque_omega.onnx', omega_closed_loop_onnx='path_tracking_smalltorque_omegaCL.onnx'),
         training=TrainingConfig(
-                    q_scale=1e-4,
-                    r_scale=1e-3,
+                    q_scale=1e-1,
+                    r_scale=1e-1,
                     omega_hidden_sizes=(32, 32,32,32, 32, 32),
                     pi_hidden_sizes=(32,32, 32,32, 32),
                     closed_loop_hidden_sizes=(32, 32,32,32, 32, 32),
@@ -778,9 +1337,24 @@ SYSTEMS: Dict[str, SystemSpec] = {
         training=TrainingConfig(
                     q_scale=1e-3,
                     r_scale=1e-3,
+                    data_profile=DataDistributionProfile(
+                        policy_total_ratio=0.01,
+                        policy_ellipse_fraction=0.2,
+                        policy_uniform_fraction=0.05,
+                        policy_gd_fraction=0.75,
+                    ),
                     omega_hidden_sizes=(120, 120, 120),
+                    omega_full_pass_epochs=False,
+                    omega_epochs=3000,
                     pi_hidden_sizes=(64, 64, 64),
+                    pi_activation="relu",
+                    pi_full_pass_epochs=True,
+                    pi_epochs=30,
+                    control_grid_points=51,
+                    control_grid_batch_size=512,
                     closed_loop_hidden_sizes=(120, 120, 120),
+                    closed_loop_full_pass_epochs=False,
+                    closed_loop_epochs=3000,
                 ),
         verification=VerificationConfig(
                     domain=((-0.4, 0.4), (-0.4, 0.4), (-0.4, 0.4), (-0.4, 0.4), (-0.4, 0.4), (-0.4, 0.4)),
@@ -803,8 +1377,9 @@ SYSTEMS: Dict[str, SystemSpec] = {
         training=TrainingConfig(
                     q_scale=1e-4,
                     r_scale=1e-3,
-                    c1_scale=0.5,
-                    boundary_diagnostic_points_per_face=50,
+                    c1_scale=1.0,
+                    boundary_diagnostic_points_per_face=100,
+                    zubov_alpha_scale=0.01,
                      data_profile=DataDistributionProfile(
                                             base_points_per_dim=1000,
                                             base_exponent=None,
@@ -818,12 +1393,12 @@ SYSTEMS: Dict[str, SystemSpec] = {
                                             omega_collocation_total_ratio=1.0,
                                             omega_collocation_ellipse_fraction=0.2,
                                             omega_collocation_uniform_fraction=0.8,
-                                            policy_total_ratio=0.01,
+                                            policy_total_ratio=0.05,
                                             policy_dimension_scale_base=1.0,
-                                            policy_ellipse_fraction=0.2,
+                                            policy_ellipse_fraction=0.5,
                                             policy_uniform_fraction=0.1,
-                                            policy_gd_fraction=0.70,
-                                            closed_loop_trajectory_total_ratio=1e-2,
+                                            policy_gd_fraction=0.40,
+                                            closed_loop_trajectory_total_ratio=1e-3,
                                             closed_loop_trajectory_dimension_scale_base=1.0,
                                             closed_loop_trajectory_ellipse_fraction=0.05,
                                             closed_loop_trajectory_uniform_fraction=0.05,
@@ -833,46 +1408,54 @@ SYSTEMS: Dict[str, SystemSpec] = {
                                             closed_loop_constraint_uniform_fraction=0.05,
                                             closed_loop_constraint_gd_fraction=0.9,
                                         ),
-                    omega_hidden_sizes=(64,64,64,64,64,64,64,64),
-                    omega_full_pass_epochs=True,
-                    omega_epochs=12,
-                    pi_hidden_sizes=(256,256,256,256,256,256,256,256,256,256),
+                    omega_hidden_sizes=(64,64,64,64,64,64),
+                    omega_rollout_horizon=1000,
+                    omega_rollouts_per_state=5000,
+                    omega_batch_size=10_000,
+                    omega_label_batch_size=500,
+                    omega_full_pass_epochs=False,
+                    omega_epochs=3000,
+                    pi_hidden_sizes=(512,512,512,512),
                     pi_activation="relu",
                     omega_lambda_data=0.01,
                     omega_boundary_noise_std=1.0,
-                    pi_lambda_control=1e-4,
+                    pi_lambda_control=1e-5,
                     pi_lambda_decrease=0.0,
                     policy_label_cache_path=None,
                     policy_label_use_confidence_weight=False,
                     policy_label_mask_out_of_domain_successors=True,
                     policy_label_near_optimal_rel_tol=1e-2,
-                    pi_lr=3e-3,
-                    optimized_sampler_max_attempts=200,
-                    pi_batch_size=8000,
+                    pi_lr=1e-3,
+                    optimized_sampler_max_attempts=10000,
+                    pi_batch_size=500,
                     pi_train_max_points=None,
                     pi_full_pass_epochs=True,
-                    pi_epochs=12,
+                    pi_epochs=30,
                     pi_log_every=1,
                     policy_decrease_report_points=200_000,
-                    closed_loop_hidden_sizes=(64,64,64,64,64,64,64,64),
+                    closed_loop_hidden_sizes=(64,64,64,64,64,64),
+                    closed_loop_horizon=1000,
                     closed_loop_train_batch_size=100_000,
-                    closed_loop_full_pass_epochs=True,
-                    closed_loop_epochs=12,
+                    closed_loop_full_pass_epochs=False,
+                    closed_loop_epochs=3000,
                     closed_loop_lr=3e-4,
-                    closed_loop_lambda_zubov=0.0,
+                    closed_loop_lambda_zubov=0.01,
                     closed_loop_data_target="trajectory",
                     closed_loop_anchor_filter="none",
                     closed_loop_lambda_data=0.1,
                     closed_loop_lambda_range=0.0,
-                    closed_loop_lambda_decrease=30.0,
-                    closed_loop_lambda_boundary=0.0001,
-                    control_grid_points = 20,
+                    closed_loop_lambda_decrease=300.0,
+                    closed_loop_lambda_boundary=0.0,
+                    control_grid_points = 21,
                     plot_pairs=((0,1),(0,2),(1,4),(2,5)),
-                    closed_loop_dos_sublevel=0.95,
-                    closed_loop_loss_dos_gate=0.95,
-                    policy_label_dos_sublevel=0.95,
-                    boundary_diagnostic_w_threshold=0.99,
-                    threshold_search_samples=1_000_000
+                    closed_loop_dos_sublevel=0.9,
+                    closed_loop_loss_dos_gate=0.9,
+                    policy_label_dos_sublevel=0.9,
+                    boundary_diagnostic_w_threshold=0.98,
+                    boundary_diagnostic_horizon=1000,
+                    boundary_diagnostic_batch_size=100,
+                    boundary_diagnostic_rollouts_per_state=5000,
+                    threshold_search_samples=100_000_000
                 ),
         verification=VerificationConfig(
                     domain=((-1.2, 1.2), (-1.2, 1.2), (-math.pi / 2.0, math.pi / 2.0), (-1.5, 1.5), (-1.5, 1.5), (-math.pi, math.pi)),
