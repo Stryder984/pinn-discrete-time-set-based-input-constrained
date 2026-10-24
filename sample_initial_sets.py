@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import os
 from datetime import datetime
@@ -25,6 +26,8 @@ from training_pipeline import heatmap_pair_suffix, normalize_plot_pairs, system_
 
 
 RUNS_ROOT = Path(__file__).resolve().parent / "pipeline_runs"
+GRID_OBJECTIVES = ("omega_orig", "norm2", "nu")
+GRID_STOP_REASONS = ("reached_roa", "horizon", "no_feasible_control", "nonfinite_state")
 
 
 def pick_device(requested: str) -> torch.device:
@@ -119,10 +122,12 @@ def omega_sublevel_rejection_samples(
 ) -> tuple[np.ndarray, dict[str, object]]:
     """Uniform rejection sample with matched outside-sublevel controls.
 
-    `n_inside` is the target number of points satisfying omega(x) <= sublevel.
-    The sampler also keeps `n_inside` points with omega(x) > sublevel from the
+    `n_inside` is the target number of points satisfying omega(x) < sublevel.
+    The sampler also keeps `n_inside` points with omega(x) >= sublevel from the
     rejected candidates, so downstream plots compare balanced classes while the
     inside class remains conditionally uniform over the proposed DOS.
+    The first batch's untruncated acceptance rate estimates the DOS volume
+    fraction within the sampling domain.
     """
     if batch_size <= 0:
         raise ValueError("--rejection-batch-size must be positive.")
@@ -137,6 +142,8 @@ def omega_sublevel_rejection_samples(
     inside_value_chunks: list[np.ndarray] = []
     outside_value_chunks: list[np.ndarray] = []
     candidates_seen = 0
+    first_pass_candidates = 0
+    first_pass_inside = 0
 
     while candidates_seen < max_candidates:
         inside_count = sum(chunk.shape[0] for chunk in inside_chunks)
@@ -149,7 +156,10 @@ def omega_sublevel_rejection_samples(
         x_np = rng.uniform(lows, highs, size=(current_batch, domain.shape[0])).astype(np.float32)
         x = torch.as_tensor(x_np, device=device, dtype=torch.float32)
         values = omega.query(x).reshape(-1).detach().cpu().numpy().astype(np.float32)
-        inside = values <= float(sublevel)
+        inside = values < float(sublevel)
+        if candidates_seen == 0:
+            first_pass_candidates = current_batch
+            first_pass_inside = int(inside.sum())
         candidates_seen += current_batch
 
         if inside.any() and inside_count < n_inside:
@@ -205,7 +215,11 @@ def omega_sublevel_rejection_samples(
         "max_candidates": int(max_candidates),
         "batch_size": int(batch_size),
         "strict": bool(strict),
-        "inside_acceptance_rate": float(inside_points.shape[0] / max(candidates_seen, 1)),
+        "first_pass_candidates": int(first_pass_candidates),
+        "first_pass_inside": int(first_pass_inside),
+        "inside_acceptance_rate": (
+            float(first_pass_inside / first_pass_candidates) if first_pass_candidates else None
+        ),
         "inside_omega_min": None if inside_values.size == 0 else float(inside_values.min()),
         "inside_omega_mean": None if inside_values.size == 0 else float(inside_values.mean()),
         "inside_omega_max": None if inside_values.size == 0 else float(inside_values.max()),
@@ -470,55 +484,168 @@ def grid_optimal_controls(
     x: torch.Tensor,
     control_grid: torch.Tensor,
     control_chunk_size: int,
-) -> torch.Tensor:
-    if x.shape[0] == 0:
-        return torch.empty((0, system.u_dim), device=x.device, dtype=x.dtype)
+    objective: str,
+    p_matrix: torch.Tensor,
+    domain: torch.Tensor,
+    candidate_batch_size: int = 4096,
+) -> dict[str, torch.Tensor]:
+    """Contained, finite one-step grid minimizer; index -1 means no valid input.
+
+    Rejection counts are disjoint: nonfinite successor, finite out-of-domain
+    successor, then nonfinite objective at a contained successor. Exact ties
+    retain the first grid index, including across chunks.
+    """
+    if objective not in GRID_OBJECTIVES:
+        raise ValueError(f"Unknown grid objective: {objective}")
+    if control_chunk_size <= 0 or candidate_batch_size <= 0 or control_grid.shape[0] == 0:
+        raise ValueError("Grid and chunk sizes must be positive.")
+    if x.shape[0] > candidate_batch_size:
+        raise ValueError("State batch exceeds candidate_batch_size; split the states first.")
+    domain = domain.to(device=x.device, dtype=x.dtype)
+    p_matrix = p_matrix.to(device=x.device, dtype=x.dtype)
     best_values = torch.full((x.shape[0],), torch.inf, device=x.device, dtype=x.dtype)
-    best_controls = torch.empty((x.shape[0], system.u_dim), device=x.device, dtype=x.dtype)
-    for u_start in range(0, control_grid.shape[0], control_chunk_size):
-        ug = control_grid[u_start : u_start + control_chunk_size].to(device=x.device, dtype=x.dtype)
+    best_controls = torch.full((x.shape[0], system.u_dim), torch.nan, device=x.device, dtype=x.dtype)
+    best_next = torch.full_like(x, torch.nan)
+    best_indices = torch.full((x.shape[0],), -1, device=x.device, dtype=torch.int64)
+    counts = {key: torch.zeros(x.shape[0], device=x.device, dtype=torch.int64) for key in
+              ("feasible_count", "out_of_domain_count", "nonfinite_successor_count", "nonfinite_objective_count")}
+    chunk_size = min(control_chunk_size, max(1, candidate_batch_size // max(1, x.shape[0])))
+    for u_start in range(0, control_grid.shape[0], chunk_size):
+        ug = control_grid[u_start : u_start + chunk_size].to(device=x.device, dtype=x.dtype)
         k = ug.shape[0]
         x_expanded = x.unsqueeze(1).expand(-1, k, -1).reshape(x.shape[0] * k, system.n_dim)
         u_expanded = ug.unsqueeze(0).expand(x.shape[0], -1, -1).reshape(x.shape[0] * k, system.u_dim)
         next_x = system.dynamics(x_expanded, u_expanded)
-        values = omega_orig.query(next_x).reshape(x.shape[0], k)
+        finite = torch.isfinite(next_x).all(dim=-1)
+        contained = finite & ((next_x >= domain[:, 0]) & (next_x <= domain[:, 1])).all(dim=-1)
+        values = torch.full((next_x.shape[0],), torch.inf, device=x.device, dtype=x.dtype)
+        if contained.any():
+            valid_x = next_x[contained]
+            if objective == "omega_orig":
+                scores = omega_orig.query(valid_x).reshape(-1)
+            elif objective == "norm2":
+                scores = valid_x.square().sum(dim=-1)
+            else:
+                scores = (valid_x @ p_matrix * valid_x).sum(dim=-1)
+            values[contained] = scores
+        finite_scores = torch.isfinite(values)
+        feasible = contained & finite_scores
+        counts["nonfinite_successor_count"] += (~finite).reshape(-1, k).sum(dim=1)
+        counts["out_of_domain_count"] += (finite & ~contained).reshape(-1, k).sum(dim=1)
+        counts["nonfinite_objective_count"] += (contained & ~finite_scores).reshape(-1, k).sum(dim=1)
+        counts["feasible_count"] += feasible.reshape(-1, k).sum(dim=1)
+        values = torch.where(feasible, values, torch.full_like(values, torch.inf)).reshape(x.shape[0], k)
         chunk_values, chunk_indices = values.min(dim=1)
         improved = chunk_values < best_values
         if improved.any():
             best_values[improved] = chunk_values[improved]
             best_controls[improved] = ug[chunk_indices[improved]]
-    return best_controls
+            best_indices[improved] = u_start + chunk_indices[improved]
+            best_next[improved] = next_x.reshape(x.shape[0], k, system.n_dim)[improved, chunk_indices[improved]]
+    return dict(controls=best_controls, next_states=best_next, grid_indices=best_indices,
+                successor_objective=best_values, **counts)
 
 
 @torch.no_grad()
-def convergence_mask_grid_optimal(
+def simulate_grid_optimal_trajectories(
     *,
     system: SystemSpec,
-    omega_orig: torch.nn.Module,
+    models: dict[str, torch.nn.Module],
     points: np.ndarray,
     control_grid: torch.Tensor,
     steps: int,
-    norm2_tol: float,
+    objective: str,
+    roa_threshold: float,
+    domain: np.ndarray,
     device: torch.device,
-    batch_size: int,
     control_chunk_size: int,
-) -> np.ndarray:
-    converged = np.zeros(points.shape[0], dtype=bool)
-    for start in range(0, points.shape[0], batch_size):
-        stop = min(start + batch_size, points.shape[0])
-        x = torch.as_tensor(points[start:stop], device=device, dtype=torch.float32)
-        for _ in range(steps):
-            u = grid_optimal_controls(
-                system=system,
-                omega_orig=omega_orig,
-                x=x,
-                control_grid=control_grid,
-                control_chunk_size=control_chunk_size,
-            )
-            x = system.dynamics(x, u)
-        final_norm2 = (x * x).sum(dim=-1).detach().cpu().numpy()
-        converged[start:stop] = final_norm2 <= float(norm2_tol)
-    return converged
+    candidate_batch_size: int = 4096,
+) -> dict[str, np.ndarray]:
+    """One bounded history batch. Padding is NaN/-1 and never simulated data."""
+    if objective not in GRID_OBJECTIVES or not np.isfinite(roa_threshold) or roa_threshold <= 0 or steps < 0:
+        raise ValueError("A known objective, finite positive ROA threshold and nonnegative horizon are required.")
+    p = models["pi"].P_matrix.to(device=device, dtype=torch.float32)
+    if (p.shape != (system.n_dim, system.n_dim) or not torch.isfinite(p).all()
+            or not torch.allclose(p, p.T) or torch.linalg.eigvalsh(p).min() <= 0):
+        raise ValueError("Saved P must be finite, symmetric and positive definite.")
+    domain_t = torch.as_tensor(domain, device=device, dtype=torch.float32)
+    if (domain_t.shape != (system.n_dim, 2) or not torch.isfinite(domain_t).all()
+            or not (domain_t[:, 0] < domain_t[:, 1]).all()):
+        raise ValueError("Invalid containment domain.")
+    x = torch.as_tensor(points, device=device, dtype=torch.float32).clone()
+    if x.ndim != 2 or x.shape[1] != system.n_dim:
+        raise ValueError("Initial points have the wrong shape.")
+    n = len(points)
+    data = {key: np.full((n, steps + 1), np.nan, dtype=np.float32)
+            for key in ("omega_orig", "omega_cl", "nu", "norm2")}
+    data["states"] = np.full((n, steps + 1, system.n_dim), np.nan, dtype=np.float32)
+    data["controls"] = np.full((n, steps, system.u_dim), np.nan, dtype=np.float32)
+    for key in ("successor_objective", "objective_delta"):
+        data[key] = np.full((n, steps), np.nan, dtype=np.float32)
+    for key in ("grid_indices", "feasible_count", "out_of_domain_count",
+                "nonfinite_successor_count", "nonfinite_objective_count"):
+        data[key] = np.full((n, steps), -1, dtype=np.int64)
+    state_lengths = np.zeros(n, dtype=np.int64)
+    attempt_lengths = np.zeros(n, dtype=np.int64)
+    reasons = np.full(n, "horizon", dtype="<U24")
+    active = torch.ones(n, device=device, dtype=torch.bool)
+    for t in range(steps + 1):
+        ids = torch.where(active)[0]
+        if not ids.numel():
+            break
+        ids_np = ids.cpu().numpy()
+        state = x[ids]
+        nu = (state @ p * state).sum(-1)
+        norm2 = state.square().sum(-1)
+        finite = torch.isfinite(state).all(-1) & torch.isfinite(nu) & torch.isfinite(norm2)
+        data["states"][ids_np, t] = state.cpu().numpy()
+        data["nu"][ids_np, t] = nu.cpu().numpy()
+        data["norm2"][ids_np, t] = norm2.cpu().numpy()
+        state_lengths[ids_np] = t + 1
+        if finite.any():
+            valid_ids = ids_np[finite.cpu().numpy()]
+            data["omega_orig"][valid_ids, t] = models["omega"].query(state[finite]).reshape(-1).cpu().numpy()
+            data["omega_cl"][valid_ids, t] = models["omega_closed_loop"].query(state[finite]).reshape(-1).cpu().numpy()
+        reasons[ids_np[~finite.cpu().numpy()]] = "nonfinite_state"
+        reached = finite & (nu <= roa_threshold)
+        reasons[ids_np[reached.cpu().numpy()]] = "reached_roa"
+        active[ids[~finite | reached]] = False
+        if t == steps:
+            break
+        ids = torch.where(active)[0]
+        if not ids.numel():
+            break
+        ids_np = ids.cpu().numpy()
+        result = grid_optimal_controls(
+            system=system, omega_orig=models["omega"], x=x[ids], control_grid=control_grid,
+            control_chunk_size=control_chunk_size, objective=objective, p_matrix=p,
+            domain=domain_t, candidate_batch_size=candidate_batch_size,
+        )
+        for key in ("controls", "grid_indices", "successor_objective", "feasible_count",
+                    "out_of_domain_count", "nonfinite_successor_count", "nonfinite_objective_count"):
+            data[key][ids_np, t] = result[key].cpu().numpy()
+        attempt_lengths[ids_np] = t + 1
+        feasible = result["grid_indices"] >= 0
+        good_np = ids_np[feasible.cpu().numpy()]
+        data["objective_delta"][good_np, t] = (
+            result["successor_objective"][feasible].cpu().numpy() - data[objective][good_np, t])
+        reasons[ids_np[~feasible.cpu().numpy()]] = "no_feasible_control"
+        active[ids[~feasible]] = False
+        # Use the selected, already checked successor; never advance placeholders.
+        x[ids[feasible]] = result["next_states"][feasible]
+    max_states = int(state_lengths.max()) if n else 0
+    max_attempts = int(attempt_lengths.max()) if n else 0
+    for key in data:
+        length = max_states if key in ("states", "omega_orig", "omega_cl", "nu", "norm2") else max_attempts
+        data[key] = data[key][:, :length]
+    data.update(state_lengths=state_lengths, attempt_lengths=attempt_lengths,
+                transition_lengths=np.maximum(state_lengths - 1, 0), stop_reason=reasons,
+                stop_step=np.maximum(state_lengths - 1, 0),
+                time=np.arange(max_states, dtype=np.float64) * float(system.dt),
+                attempt_time=np.arange(max_attempts, dtype=np.float64) * float(system.dt))
+    data["stop_time"] = data["stop_step"] * float(system.dt)
+    data["terminal_states"] = x.cpu().numpy()
+    return data
 
 
 def select_for_plot(points: np.ndarray, max_points: int, seed: int) -> np.ndarray:
@@ -777,65 +904,138 @@ def trajectory_values_for_plot(
     }
 
 
-@torch.no_grad()
-def simulate_grid_optimal_trajectories(
-    *,
-    system: SystemSpec,
-    models: dict[str, torch.nn.Module],
-    points: np.ndarray,
-    control_grid: torch.Tensor,
-    steps: int,
-    device: torch.device,
-    control_chunk_size: int,
-) -> dict[str, np.ndarray]:
-    if points.shape[0] == 0:
-        return {
-            "states": np.empty((0, steps + 1, system.n_dim), dtype=np.float32),
-            "omega_orig": np.empty((0, steps + 1), dtype=np.float32),
-            "omega_cl": np.empty((0, steps + 1), dtype=np.float32),
-            "nu": np.empty((0, steps + 1), dtype=np.float32),
-            "norm2": np.empty((0, steps + 1), dtype=np.float32),
-            "controls": np.empty((0, steps, system.u_dim), dtype=np.float32),
-        }
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
-    omega_orig = models["omega"]
-    omega_cl = models["omega_closed_loop"]
-    pi = models["pi"]
-    p_matrix = pi.P_matrix.to(device=device, dtype=torch.float32)
-    state = torch.as_tensor(points, device=device, dtype=torch.float32)
-    n_traj = state.shape[0]
-    states = torch.empty((n_traj, steps + 1, system.n_dim), device=device)
-    omega_orig_values = torch.empty((n_traj, steps + 1), device=device)
-    omega_cl_values = torch.empty((n_traj, steps + 1), device=device)
-    nu_values = torch.empty((n_traj, steps + 1), device=device)
-    norm2_values = torch.empty((n_traj, steps + 1), device=device)
-    controls = torch.empty((n_traj, steps, system.u_dim), device=device)
 
-    for t in range(steps + 1):
-        states[:, t, :] = state
-        omega_orig_values[:, t] = omega_orig.query(state).reshape(-1)
-        omega_cl_values[:, t] = omega_cl.query(state).reshape(-1)
-        nu_values[:, t] = (state @ p_matrix * state).sum(dim=-1)
-        norm2_values[:, t] = (state * state).sum(dim=-1)
-        if t < steps:
-            control = grid_optimal_controls(
-                system=system,
-                omega_orig=omega_orig,
-                x=state,
-                control_grid=control_grid,
-                control_chunk_size=control_chunk_size,
+def select_grid_roa_threshold(thresholds: dict, name: str) -> float:
+    """Use the requested saved threshold exactly; never silently fall back."""
+    if name not in ("c1", "c2"):
+        raise ValueError("Grid stopping threshold must be c1 or c2.")
+    try:
+        value = float(thresholds[name])
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError(f"Grid comparisons require a finite positive {name} in this run's thresholds file.") from error
+    if not np.isfinite(value) or value <= 0:
+        raise ValueError(f"Grid comparisons require a finite positive {name} in this run's thresholds file.")
+    return value
+
+
+def run_grid_controller_comparison(
+    *, system: SystemSpec, models: dict[str, torch.nn.Module], points: np.ndarray,
+    inside_mask: np.ndarray, classification_values: np.ndarray, control_grid: torch.Tensor,
+    objectives: Sequence[str], roa_threshold: float, domain: np.ndarray, steps: int,
+    device: torch.device, rollout_batch_size: int, candidate_batch_size: int,
+    control_chunk_size: int, output_dir: Path, metadata: dict, roa_threshold_name: str = "c1",
+) -> dict:
+    """Persist every initial point and rollout in independently readable NPZ batches."""
+    if (not objectives or len(set(objectives)) != len(objectives)
+            or any(key not in GRID_OBJECTIVES for key in objectives)):
+        raise ValueError("Select distinct known grid objectives.")
+    if min(rollout_batch_size, candidate_batch_size, control_chunk_size) <= 0:
+        raise ValueError("Comparison batch sizes must be positive.")
+    if (roa_threshold_name not in ("c1", "c2") or not np.isfinite(roa_threshold)
+            or roa_threshold <= 0 or steps < 0):
+        raise ValueError("Comparison requires a named c1/c2 ROA threshold, finite positive value and nonnegative steps.")
+    if inside_mask.shape != (len(points),) or classification_values.shape != (len(points),):
+        raise ValueError("Classification arrays must align with all initial points.")
+    if (control_grid.ndim != 2 or control_grid.shape[1] != system.u_dim or not len(control_grid)
+            or not torch.isfinite(control_grid).all()):
+        raise ValueError("Invalid control grid.")
+    lower = torch.tensor(system.u_lb, device=control_grid.device, dtype=control_grid.dtype)
+    upper = torch.tensor(system.u_hi, device=control_grid.device, dtype=control_grid.dtype)
+    if not ((control_grid >= lower) & (control_grid <= upper)).all():
+        raise ValueError("Grid controls must lie in the input box.")
+    # Bound dense CPU history storage to approximately 256 MiB per shard.
+    bytes_per_trajectory = (steps + 1) * (4 * (system.n_dim + 4)) + steps * (4 * (system.u_dim + 2) + 8 * 5)
+    effective_batch = min(rollout_batch_size, candidate_batch_size,
+                          max(1, (256 * 1024**2) // max(1, bytes_per_trajectory)))
+    output_dir.mkdir(parents=True, exist_ok=False)
+    point_ids = np.arange(len(points), dtype=np.int64)
+    np.savez_compressed(output_dir / "shared.npz", point_ids=point_ids, initial_states=points,
+                        inside_mask=inside_mask, classification_values=classification_values,
+                        control_grid=control_grid.detach().cpu().numpy(), domain=domain,
+                        P=models["pi"].P_matrix.detach().cpu().numpy(),
+                        roa_threshold=np.array(roa_threshold), roa_threshold_name=np.array(roa_threshold_name), dt=np.array(system.dt))
+    manifest = dict(metadata, schema_version=2, status="running", shared_data="shared.npz",
+                    system=system.name, objectives=list(objectives),
+                    roa_threshold=float(roa_threshold), roa_threshold_name=roa_threshold_name, dt=float(system.dt),
+                    horizon=int(steps), dtype="float32", device=str(device),
+                    requested_rollout_batch_size=rollout_batch_size, effective_rollout_batch_size=effective_batch,
+                    candidate_batch_size=candidate_batch_size, control_chunk_size=control_chunk_size,
+                    control_grid_total_points=len(control_grid),
+                    stopping_criterion=f"first nu(x)<={roa_threshold_name}, including step zero",
+                    containment="all successor coordinates within saved domain, inclusive",
+                    tie_break="first control-grid index among exactly equal finite minima",
+                    stop_reasons=list(GRID_STOP_REASONS),
+                    array_conventions={
+                        "states": "[point, state_step, coordinate]; valid before state_lengths",
+                        "state_values": "omega_orig, omega_cl, nu, norm2 share the states axis",
+                        "search_attempts": "controls, grid_indices, successor_objective, objective_delta and rejection/feasible counts; valid before attempt_lengths",
+                        "transitions": "only attempts before transition_lengths advance the dynamics",
+                        "failed_attempt": "grid_indices=-1, controls=NaN, successor_objective=inf; counts retained; no transition",
+                        "padding": "float NaN / integer -1, excluded by lengths; never a continuation",
+                        "time": "time and attempt_time are shared axes in seconds within each shard",
+                        "point_ids": "global IDs index shared.npz; identical across controllers",
+                        "nonfinite_objective_count": "count only among finite contained successor states",
+                        "omega_cl": "recorded for plotting only; never a control objective",
+                    }, controllers={})
+    manifest_path = output_dir / "manifest.json"
+
+    def save_manifest():
+        temporary = output_dir / "manifest.partial.json"
+        temporary.write_text(json.dumps(manifest, indent=2, allow_nan=False), encoding="utf-8")
+        temporary.replace(manifest_path)
+
+    save_manifest()
+    for objective in objectives:
+        entry = dict(status="running", shards=[], summary={})
+        manifest["controllers"][objective] = entry
+        save_manifest()
+        all_reasons, all_steps = [], []
+        for start in range(0, len(points), effective_batch):
+            stop = min(start + effective_batch, len(points))
+            try:
+                data = simulate_grid_optimal_trajectories(
+                    system=system, models=models, points=points[start:stop], control_grid=control_grid,
+                    steps=steps, objective=objective, roa_threshold=roa_threshold, domain=domain, device=device,
+                    control_chunk_size=control_chunk_size, candidate_batch_size=candidate_batch_size,
+                )
+                data["point_ids"] = point_ids[start:stop]
+                filename = f"{objective}_{start:08d}_{stop:08d}.npz"
+                np.savez_compressed(output_dir / filename, **data)
+            except (Exception, KeyboardInterrupt) as error:
+                entry["status"] = manifest["status"] = "interrupted" if isinstance(error, KeyboardInterrupt) else "failed"
+                entry["error"] = dict(type=type(error).__name__, message=str(error), start=start, stop=stop)
+                save_manifest()
+                raise
+            entry["shards"].append(dict(file=filename, start=start, stop=stop, sha256=file_sha256(output_dir / filename)))
+            all_reasons.append(data["stop_reason"])
+            all_steps.append(data["stop_step"])
+            save_manifest()
+        reasons = np.concatenate(all_reasons) if all_reasons else np.empty(0, dtype="<U24")
+        stop_steps = np.concatenate(all_steps) if all_steps else np.empty(0, dtype=np.int64)
+        for group, mask in (("all", np.ones(len(points), dtype=bool)), ("inside", inside_mask), ("outside", ~inside_mask)):
+            reached = mask & (reasons == "reached_roa")
+            entry["summary"][group] = dict(
+                count=int(mask.sum()), reached_roa=int(reached.sum()),
+                reached_fraction=float(reached.sum() / mask.sum()) if mask.any() else None,
+                median_entry_step=float(np.median(stop_steps[reached])) if reached.any() else None,
+                median_entry_time=float(np.median(stop_steps[reached]) * system.dt) if reached.any() else None,
+                termination_counts={reason: int((mask & (reasons == reason)).sum()) for reason in GRID_STOP_REASONS},
             )
-            controls[:, t, :] = control
-            state = system.dynamics(state, control)
-
-    return {
-        "states": states.cpu().numpy(),
-        "omega_orig": omega_orig_values.cpu().numpy(),
-        "omega_cl": omega_cl_values.cpu().numpy(),
-        "nu": nu_values.cpu().numpy(),
-        "norm2": norm2_values.cpu().numpy(),
-        "controls": controls.cpu().numpy(),
-    }
+        entry["status"] = "complete"
+        save_manifest()
+    manifest["status"] = "complete"
+    manifest["shared_sha256"] = file_sha256(output_dir / "shared.npz")
+    save_manifest()
+    return {"manifest": str(manifest_path), "criterion": manifest["stopping_criterion"],
+            "roa_threshold_name": roa_threshold_name, "roa_threshold": float(roa_threshold),
+            "controllers": {key: value["summary"] for key, value in manifest["controllers"].items()}}
 
 
 def write_points_csv(
@@ -868,7 +1068,7 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
     parser.add_argument("--steps", type=int, default=100, help="Closed-loop simulation length for convergence checks.")
     parser.add_argument("--convergence-norm2-tol", type=float, default=1e-3, help="Converged iff final ||x||^2 is at most this value.")
     parser.add_argument("--seed", type=int, default=43215, help="Random seed for uniform samples and plot subsampling.")
-    parser.add_argument("--batch-size", type=int, default=4096, help="Batch size for classification and convergence simulation.")
+    parser.add_argument("--batch-size", type=int, default=4096, help="Batch size for classification/convergence; also bounds state-control pairs per grid evaluation.")
     parser.add_argument(
         "--sampling-mode",
         choices=("uniform", "omega-sublevel-gd", "omega-sublevel-rejection"),
@@ -926,13 +1126,19 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
         default="stitched",
         help="Controller used for the main rollout: stitched uses clamped LQR for nu<=c2 and saturated NN otherwise.",
     )
-    parser.add_argument("--include-grid-optimal", action="store_true", help="Also simulate the training grid-search argmin controller.")
+    parser.add_argument("--include-grid-optimal", action="store_true", help="Save contained grid-minimizer comparisons stopping at the selected quadratic ROA (all three objectives by default).")
+    parser.add_argument("--grid-stop-threshold", choices=("c1", "c2"), default="c1", help="Saved quadratic threshold for first-entry stopping in grid comparisons; c1 analytic local region or c2 expanded region. Default: c1. Does not change the learned-controller simulation.")
+    parser.add_argument("--grid-objectives", nargs="+", choices=GRID_OBJECTIVES, default=list(GRID_OBJECTIVES), help="One-step objectives to compare on identical initial points.")
+    parser.add_argument("--grid-comparison-dir", default=None, help="New directory for all comparison histories and their manifest; never overwritten.")
+    parser.add_argument("--grid-rollout-batch-size", type=int, default=128, help="Maximum trajectories per saved history batch; further bounded by memory and --batch-size.")
+    parser.add_argument("--grid-max-plot-trajectories", type=int, default=60, help="Matched initial points displayed in comparison figures; 0 plots all. Tables always use all saved points.")
+    parser.add_argument("--grid-increase-tol", type=float, default=0.0, help="Positive own-objective increment threshold for yellow segments and increase tables.")
     parser.add_argument("--control-grid-points", type=int, default=None, help="Override grid points per input dimension for grid-optimal rollouts.")
     parser.add_argument("--control-chunk-size", type=int, default=50_000, help="Control-grid chunk size for grid-optimal argmin evaluation.")
     parser.add_argument("--output", default=None, help="PNG output path. Defaults to the run's plots/ directory.")
     parser.add_argument("--control-output", default=None, help="PNG output path for learned-controller control inputs.")
-    parser.add_argument("--grid-optimal-output", default=None, help="PNG output path for grid-optimal rollouts.")
-    parser.add_argument("--grid-optimal-control-output", default=None, help="PNG output path for grid-optimal control inputs.")
+    parser.add_argument("--grid-optimal-output", default=None, help="Retired single-controller output: use --grid-comparison-dir for the combined report.")
+    parser.add_argument("--grid-optimal-control-output", default=None, help="Retired single-controller output: use --grid-comparison-dir for the combined report.")
     parser.add_argument(
         "--initial-convergence-output",
         default=None,
@@ -954,6 +1160,17 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
     parser.add_argument("--points-csv", default=None, help="Optional CSV output for sampled points and labels.")
     args = parser.parse_args(argv)
 
+    if args.grid_optimal_output is not None or args.grid_optimal_control_output is not None:
+        parser.error("Use --grid-comparison-dir for complete histories and the combined comparison report.")
+    if not args.include_grid_optimal and args.grid_comparison_dir is not None:
+        parser.error("--grid-comparison-dir requires --include-grid-optimal.")
+    if args.grid_rollout_batch_size <= 0 or args.control_chunk_size <= 0:
+        parser.error("Grid rollout and control chunk sizes must be positive.")
+    if len(set(args.grid_objectives)) != len(args.grid_objectives):
+        parser.error("--grid-objectives must not repeat objectives.")
+    if args.grid_max_plot_trajectories < 0 or not np.isfinite(args.grid_increase_tol) or args.grid_increase_tol < 0:
+        parser.error("Grid plot limit and increase tolerance must be finite and nonnegative.")
+
     if args.samples <= 0:
         raise ValueError("--samples must be positive.")
     if args.steps < 0:
@@ -974,11 +1191,15 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
     system = system_with_existing_run_domain(system, run_dir)
     artifact_dir = require_artifacts(system, run_dir)
     thresholds = load_thresholds(run_dir)
+    roa_threshold = None
+    if args.include_grid_optimal:
+        roa_threshold = select_grid_roa_threshold(thresholds, args.grid_stop_threshold)
     w2 = float(thresholds["w2"])
     c2 = float(thresholds["c2"])
     domain = verification_domain(system, run_dir)
     training_config = run_training_config(run_dir)
     device = pick_device(args.device)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
 
     models = load_models(system, artifact_dir, device=device)
     requested_omega_key = "omega_closed_loop" if args.sampling_omega == "closed-loop" else "omega"
@@ -991,8 +1212,8 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
         classification_omega_key = "omega_closed_loop"
         classification_omega_name = "omega_cl"
         classification_sublevel = w2
-    inside_label = f"{classification_omega_name} <= {classification_sublevel:.6g}"
-    outside_label = f"{classification_omega_name} > {classification_sublevel:.6g}"
+    inside_label = f"{classification_omega_name} < {classification_sublevel:.6g}"
+    outside_label = f"{classification_omega_name} >= {classification_sublevel:.6g}"
 
     if args.sampling_mode == "uniform":
         points = uniform_samples(domain, args.samples, args.seed)
@@ -1080,37 +1301,39 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
             else int(training_config.get("control_grid_points", system.training.control_grid_points))
         )
         control_grid = make_control_grid(system, grid_points, device=device, dtype=torch.float32)
-        inside_converged_grid = convergence_mask_grid_optimal(
-            system=system,
-            omega_orig=models["omega"],
-            points=inside_points,
-            control_grid=control_grid,
-            steps=args.steps,
-            norm2_tol=args.convergence_norm2_tol,
-            device=device,
-            batch_size=args.batch_size,
-            control_chunk_size=args.control_chunk_size,
+        comparison_dir = (Path(args.grid_comparison_dir).expanduser().resolve()
+                          if args.grid_comparison_dir else run_dir / f"grid_controller_comparison_{timestamp}")
+        checkpoint_paths = required_checkpoint_paths(system, artifact_dir)
+        source_paths = [Path(__file__), Path(__file__).with_name("systems.py"),
+                        Path(__file__).with_name("models.py"), Path(__file__).with_name("training_pipeline.py")]
+        grid_stats = run_grid_controller_comparison(
+            system=system, models=models, points=points, inside_mask=inside_mask,
+            classification_values=classification_values, control_grid=control_grid,
+            objectives=args.grid_objectives, roa_threshold=roa_threshold,
+            roa_threshold_name=args.grid_stop_threshold, domain=domain, steps=args.steps,
+            device=device, rollout_batch_size=args.grid_rollout_batch_size,
+            candidate_batch_size=args.batch_size, control_chunk_size=args.control_chunk_size,
+            output_dir=comparison_dir,
+            metadata={
+                "run_dir": str(run_dir), "seed": args.seed, "sampling": sampling_stats,
+                "classification_omega": classification_omega_name,
+                "classification_sublevel": classification_sublevel, "classification_relation": "strict <",
+                "control_grid_points_per_dim": grid_points, "arguments": vars(args),
+                "input_domain": list(zip(system.u_lb, system.u_hi)),
+                "state_labels": list(system.state_labels or tuple(f"x{i}" for i in range(system.n_dim))),
+                "checkpoints": [{"path": str(path), "sha256": file_sha256(path)} for path in checkpoint_paths],
+                "sources": [{"path": str(path), "sha256": file_sha256(path)} for path in source_paths],
+                "thresholds": {"path": str(run_dir / "verification_thresholds_rescaled.json"),
+                               "sha256": file_sha256(run_dir / "verification_thresholds_rescaled.json")},
+            },
         )
-        outside_converged_grid = convergence_mask_grid_optimal(
-            system=system,
-            omega_orig=models["omega"],
-            points=outside_points,
-            control_grid=control_grid,
-            steps=args.steps,
-            norm2_tol=args.convergence_norm2_tol,
-            device=device,
-            batch_size=args.batch_size,
-            control_chunk_size=args.control_chunk_size,
-        )
-        grid_stats = {
-            "controller": "training_grid_search_argmin_u_omega_orig_next",
-            "control_grid_points_per_dim": int(grid_points),
-            "control_grid_total_points": int(control_grid.shape[0]),
-            "classification_omega": classification_omega_name,
-            "classification_sublevel": float(classification_sublevel),
-            "n_classification_sublevel_initial_conditions_convergent": int(inside_converged_grid.sum()),
-            "n_initial_points_outside_sublevel_convergent": int(outside_converged_grid.sum()),
-        }
+        # Reporting reads the saved histories, rather than running a second set
+        # of trajectories for figures. Its tables include EVERY sampled point.
+        from plot_grid_controller_comparison import generate_report
+        report = generate_report(comparison_dir, device=str(device),
+                                 max_trajectories=args.grid_max_plot_trajectories,
+                                 seed=args.seed, increase_tol=args.grid_increase_tol)
+        grid_stats["report_dir"] = report["report_dir"]
 
     stats = {
         "system": system.name,
@@ -1159,9 +1382,8 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
     else:
         stats["n_verification_domain_rejection_sublevel_samples"] = int(points.shape[0])
     if grid_stats is not None:
-        stats["grid_optimal_controller"] = grid_stats
+        stats["grid_controller_comparison"] = grid_stats
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_path = (
         Path(args.output).expanduser().resolve()
         if args.output is not None
@@ -1213,7 +1435,7 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
         output_path=output_path,
         title=(
             f"{system.name}: sampled initial sets "
-            f"({run_dir.name}, {classification_omega_name}<={classification_sublevel:.6g})"
+            f"({run_dir.name}, {classification_omega_name}<{classification_sublevel:.6g})"
         ),
     )
     plot_control_inputs_side_by_side(
@@ -1275,61 +1497,6 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
         )
     stats["initial_convergence_slice_plots"] = initial_convergence_summaries
 
-    grid_output_path = None
-    grid_control_output_path = None
-    if args.include_grid_optimal:
-        assert control_grid is not None
-        grid_output_path = (
-            Path(args.grid_optimal_output).expanduser().resolve()
-            if args.grid_optimal_output is not None
-            else run_dir / "plots" / f"sampled_initial_sets_grid_optimal_{timestamp}.png"
-        )
-        grid_control_output_path = (
-            Path(args.grid_optimal_control_output).expanduser().resolve()
-            if args.grid_optimal_control_output is not None
-            else run_dir / "plots" / f"sampled_initial_sets_grid_optimal_controls_{timestamp}.png"
-        )
-        grid_values_inside = simulate_grid_optimal_trajectories(
-            system=system,
-            models=models,
-            points=inside_plot_points,
-            control_grid=control_grid,
-            steps=args.steps,
-            device=device,
-            control_chunk_size=args.control_chunk_size,
-        )
-        grid_values_outside = simulate_grid_optimal_trajectories(
-            system=system,
-            models=models,
-            points=outside_plot_points,
-            control_grid=control_grid,
-            steps=args.steps,
-            device=device,
-            control_chunk_size=args.control_chunk_size,
-        )
-        plot_side_by_side(
-            values_inside=grid_values_inside,
-            values_outside=grid_values_outside,
-            sublevel=classification_sublevel,
-            sublevel_key=classification_omega_name,
-            inside_label=inside_label,
-            outside_label=outside_label,
-            output_path=grid_output_path,
-            title=(
-                f"{system.name}: grid-optimal rollouts "
-                f"({run_dir.name}, {classification_omega_name}<={classification_sublevel:.6g})"
-            ),
-        )
-        plot_control_inputs_side_by_side(
-            values_inside=grid_values_inside,
-            values_outside=grid_values_outside,
-            system=system,
-            inside_label=inside_label,
-            outside_label=outside_label,
-            output_path=grid_control_output_path,
-            title=f"{system.name}: grid-optimal control inputs ({run_dir.name})",
-        )
-
     stats_path.write_text(json.dumps(stats, indent=2), encoding="utf-8")
     print(json.dumps(stats, indent=2))
     print(f"Saved stats: {stats_path}")
@@ -1337,10 +1504,9 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
     print(f"Saved control plot: {control_output_path}")
     for path in initial_convergence_paths:
         print(f"Saved initial convergence plot: {path}")
-    if grid_output_path is not None:
-        print(f"Saved grid-optimal plot: {grid_output_path}")
-    if grid_control_output_path is not None:
-        print(f"Saved grid-optimal control plot: {grid_control_output_path}")
+    if grid_stats is not None:
+        print(f"Saved all grid-controller histories: {grid_stats['manifest']}")
+        print(f"Saved grid comparison figures and tables: {grid_stats['report_dir']}")
 
     if args.points_csv is not None:
         points_csv = Path(args.points_csv).expanduser().resolve()
