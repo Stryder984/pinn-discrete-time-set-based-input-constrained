@@ -19,6 +19,7 @@ import numpy as np
 import torch
 
 from models import OmegaNet, PiNet, hidden_sizes_from_state_dict, load_models, load_omeganet, load_pinet
+from pipeline_timing import PipelineTiming, timed_stage
 from systems import DataDistributionCounts, SystemSpec, TrainingConfig, get_system, tensor_bounds
 
 
@@ -5219,8 +5220,6 @@ def save_value_heatmap_decrease_diagnostic_2d(
         Line2D([0], [0], color="cyan", lw=1.8, linestyle="--", label="omega=w1"),
         Line2D([0], [0], color="lime", lw=1.8, linestyle="--", label="omega=w2"),
         Line2D([0], [0], color="black", lw=0.8, label="value level curves"),
-        Line2D([0], [0], color="white", lw=6, alpha=0.5, label="saturated-NN violation"),
-        Line2D([0], [0], color="white", lw=6, alpha=0.5, label="optimal-label violation"),
     ]
     legend_handles.extend(quadratic_control_plot_overlay(
         system, run, artifact_dir, p_matrix, axes, x0_np, x1_np, nu_values))
@@ -5889,6 +5888,8 @@ class TrainingPipeline:
         self.lqr_box_artifacts: Optional[LQRBoxArtifacts] = None
         self.early_lqr_c2_result: Optional[EarlyLqrC2SearchResult] = None
         self.skip_preflight = bool(skip_preflight)
+        timing_root = run.run_dir if run is not None else self.artifact_dir()
+        self.timing = PipelineTiming(timing_root / "timings", system=system.name, device=self.device)
         set_seed(system.training.seed)
 
     def artifact_dir(self) -> Path:
@@ -6026,6 +6027,7 @@ class TrainingPipeline:
 
 ##
 ##
+    @timed_stage(initial_phase="lqr_setup")
     def setup_lqr_box(self) -> None:
         # Working notebook reference: Block 3.
         #
@@ -6127,6 +6129,7 @@ class TrainingPipeline:
             c_scale=float(cfg.c1_scale),
         )
 
+    @timed_stage(initial_phase="domain_diagnostics")
     def diagnose_training_domain(self) -> None:
         # This stage asks whether the configured training/search rectangle is
         # likely large enough to contain the practical DOS. It probes boundary
@@ -6164,6 +6167,7 @@ class TrainingPipeline:
                 )
             raw_path.write_text("\n".join(rows) + "\n", encoding="utf-8")
 
+    @timed_stage()
     def train_omega(self) -> None:
         # Working notebook reference: Block 5.
         #
@@ -6205,6 +6209,7 @@ class TrainingPipeline:
         p_matrix = self.lqr_box_artifacts.P.to(device=self.device, dtype=torch.float32)
         k_matrix = self.lqr_box_artifacts.K.to(device=self.device, dtype=torch.float32)
         expansion_result = None
+        self.timing.phase("domain_expansion")
         boundary_points_cpu = torch.empty(0, self.system.n_dim)
         boundary_v_cpu = torch.empty(0)
         boundary_w_cpu = torch.empty(0)
@@ -6269,6 +6274,7 @@ class TrainingPipeline:
                 f"domain_expansion_strategy={cfg.domain_expansion_strategy!r}."
             )
 
+        self.timing.phase("data_preparation")
         print("Refreshing LQR containment levels on the active domain...")
         cap_lqr_artifacts_to_state_domain(
             self.lqr_box_artifacts,
@@ -6334,6 +6340,7 @@ class TrainingPipeline:
             z_x=torch.cat([batch.z_x.detach().cpu() for batch in label_batches], dim=0),
             target_w=torch.cat([batch.target_w.detach().cpu() for batch in label_batches], dim=0),
         )
+        self.timing.phase("plotting")
         save_finite_horizon_target_plot(
             self.run_context,
             artifact_dir,
@@ -6344,6 +6351,7 @@ class TrainingPipeline:
             c_s=self.lqr_box_artifacts.c_s,
         )
 
+        self.timing.phase("data_preparation")
         print("Preparing original omega interval residual collocation set...")
         print(f"  collocation uniform    = {counts.omega_collocation_uniform_points}")
         print(f"  collocation ellipse    = {omega_collocation_ellipse.shape[0]}")
@@ -6454,6 +6462,7 @@ class TrainingPipeline:
                 f"{omega_batches_per_epoch} minibatches/epoch at batch_size={cfg.omega_batch_size}"
             )
         loss_history = []
+        self.timing.phase("optimization")
         for epoch in range(cfg.omega_epochs):
             omega.train()
             epoch_data_loss = 0.0
@@ -6535,6 +6544,8 @@ class TrainingPipeline:
                     f"total={total_loss_scalar:.6g}"
                 )
 
+        self.timing.phase("checkpoint_serialization")
+        self.timing.final_loss(loss_history, filename="omega_loss_history.json")
         omega.eval()
         checkpoint = {
             "model_state_dict": omega.state_dict(),
@@ -6614,6 +6625,7 @@ class TrainingPipeline:
         }
         save_path = artifact_dir / self.system.checkpoints.omega
         torch.save(checkpoint, save_path)
+        self.timing.phase("loss_history_and_plotting")
         save_loss_history_artifacts(
             self.run_context,
             artifact_dir,
@@ -6623,6 +6635,7 @@ class TrainingPipeline:
         )
         print(f"Original omega checkpoint saved to {save_path}")
 
+    @timed_stage()
     def train_policy(self) -> None:
         # Working notebook reference: policy/Grid-search Block 6-ish section.
         #
@@ -6645,6 +6658,7 @@ class TrainingPipeline:
         artifact_dir = self.artifact_dir()
         artifact_dir.mkdir(parents=True, exist_ok=True)
 
+        self.timing.phase("data_preparation")
         omega_path = self.checkpoint_path(self.system.checkpoints.omega, "original omega")
         omega = load_omeganet(omega_path, n_dim=self.system.n_dim, device=self.device)
         omega.eval()
@@ -7048,6 +7062,7 @@ class TrainingPipeline:
                 f"{policy_batches_per_epoch} minibatches/epoch at batch_size={cfg.pi_batch_size}"
             )
         loss_history = []
+        self.timing.phase("optimization")
         for epoch in range(cfg.pi_epochs):
             pi.train()
             epoch_value_loss = 0.0
@@ -7163,6 +7178,8 @@ class TrainingPipeline:
                     f"eval_control={eval_control_loss.item():.6g}"
                 )
 
+        self.timing.phase("diagnostics")
+        self.timing.final_loss(loss_history, filename="policy_loss_history.json")
         pi.eval()
         policy_report = None
         report_points = min(int(cfg.policy_decrease_report_points), int(n_train))
@@ -7202,6 +7219,7 @@ class TrainingPipeline:
                 f"max_delta={overall['omega_orig_max_delta']:.6g}, "
                 f"p95_delta={overall['omega_orig_p95_delta']:.6g}"
             )
+        self.timing.phase("checkpoint_serialization")
         checkpoint = {
             "model_state_dict": pi.state_dict(),
             "n_dim": int(self.system.n_dim),
@@ -7264,6 +7282,7 @@ class TrainingPipeline:
         }
         save_path = artifact_dir / self.system.checkpoints.pi
         torch.save(checkpoint, save_path)
+        self.timing.phase("loss_history_and_plotting")
         save_loss_history_artifacts(
             self.run_context,
             artifact_dir,
@@ -7280,6 +7299,7 @@ class TrainingPipeline:
         )
         print(f"PiNet checkpoint saved to {save_path}")
 
+    @timed_stage()
     def train_closed_loop_omega(self) -> None:
         # Working notebook reference: Block 8.
         #
@@ -7319,6 +7339,7 @@ class TrainingPipeline:
         if cfg.closed_loop_train_batch_size <= 0:
             raise ValueError("closed_loop_train_batch_size must be positive.")
 
+        self.timing.phase("data_preparation")
         pi_path = self.checkpoint_path(self.system.checkpoints.pi, "policy")
         omega_path = self.checkpoint_path(self.system.checkpoints.omega, "original omega")
 
@@ -7536,6 +7557,7 @@ class TrainingPipeline:
                 "Closed-loop Zubov residual is active but its combined constraint dataset is empty."
             )
         require_trainable_parameters(omega_cl, name="closed-loop omega after label construction")
+        self.timing.phase("plotting")
         save_finite_horizon_target_plot(
             self.run_context,
             artifact_dir,
@@ -7546,6 +7568,7 @@ class TrainingPipeline:
             c_s=self.lqr_box_artifacts.c_s,
         )
 
+        self.timing.phase("data_preparation")
         def closed_loop_step(x: torch.Tensor) -> torch.Tensor:
             return self.system.dynamics(
                 x,
@@ -7578,6 +7601,7 @@ class TrainingPipeline:
                 f"at batch_size={cfg.closed_loop_train_batch_size}"
             )
         loss_history = []
+        self.timing.phase("optimization")
         for epoch in range(cfg.closed_loop_epochs):
             omega_cl.train()
             epoch_zubov_loss = 0.0
@@ -7685,6 +7709,8 @@ class TrainingPipeline:
                     f"total={total_loss_scalar:.6g}"
                 )
 
+        self.timing.phase("checkpoint_serialization")
+        self.timing.final_loss(loss_history, filename="omega_closed_loop_loss_history.json")
         omega_cl.eval()
         checkpoint = {
             "model_state_dict": omega_cl.state_dict(),
@@ -7779,6 +7805,7 @@ class TrainingPipeline:
         }
         save_path = artifact_dir / self.system.checkpoints.omega_closed_loop
         torch.save(checkpoint, save_path)
+        self.timing.phase("loss_history_and_plotting")
         save_loss_history_artifacts(
             self.run_context,
             artifact_dir,
@@ -7786,6 +7813,7 @@ class TrainingPipeline:
             title="Closed-Loop Omega Training Losses",
             history=loss_history,
         )
+        self.timing.phase("diagnostics")
         validation_total = int(cfg.closed_loop_validation_points)
         if validation_total > 0:
             val_ellipse, val_uniform, val_rejection = _split_count(
@@ -7835,6 +7863,7 @@ class TrainingPipeline:
             )
         print(f"Closed-loop omega checkpoint saved to {save_path}")
 
+    @timed_stage()
     def search_thresholds(self) -> None:
         """Sample c2, w1, w2 and record raw/rescaled witness data. NO C2 CAP
 
@@ -7887,6 +7916,7 @@ class TrainingPipeline:
         print(f"    c_input      = {self.lqr_box_artifacts.c_input:.9g}")
         print(f"    domain box   = {self.lqr_box_artifacts.c_box:.9g}")
         print(f"    LQR grid     = {self.lqr_box_artifacts.c_nonlinear_decrease_grid:.9g}")
+        self.timing.phase("threshold_search")
         result = sampled_threshold_search(
             self.system,
             pi,
@@ -7904,10 +7934,13 @@ class TrainingPipeline:
             device=self.device,
         )
 
+        self.timing.phase("result_serialization")
         full_payload = asdict(result)
         if cfg.quadratic_control_search_enabled:
+            self.timing.phase("quadratic_control_search")
             quadratic_result = quadratic_control_grid_search(
                 self.system, p_matrix, c1=self.lqr_box_artifacts.c_analytic, device=self.device)
+            self.timing.phase("result_serialization")
             full_payload["quadratic_control_diagnostic"] = quadratic_result
             if self.run_context is not None:
                 self.run_context.write_json("quadratic_control_search.json", quadratic_result)
@@ -8044,6 +8077,7 @@ class TrainingPipeline:
         )
         print(f"  grid band good/bad = {result.band_good_count} / {result.band_bad_count}")
 
+    @timed_stage(initial_phase="plotting_and_diagnostics")
     def plot_threshold_diagnostics(self) -> None:
         """Plot supplied verifier thresholds against the learned closed-loop value.
 
@@ -8154,6 +8188,7 @@ class TrainingPipeline:
         print(f"  heatmap plot pairs  = {plot_pairs}")
         print(f"  thresholds         = {threshold_path if thresholds else 'systems.py verification config'}")
 
+    @timed_stage(initial_phase="plotting_and_diagnostics")
     def plot_policy_label_gap_diagnostics(self) -> None:
         """Optional expensive diagnostic for grid-search policy label ambiguity."""
         if self.lqr_box_artifacts is None:
@@ -8200,6 +8235,7 @@ class TrainingPipeline:
         print(f"  near-optimal tol  = {self.system.training.policy_label_gap_near_optimal_rel_tol:.9g}")
         print(f"  thresholds        = {threshold_path if thresholds else 'systems.py verification config'}")
 
+    @timed_stage()
     def export(self) -> None:
         # Save only artifacts whose construction has been reviewed:
         #   - raw PyTorch checkpoints with metadata,
@@ -8212,6 +8248,7 @@ class TrainingPipeline:
             "Add export once the reviewed training stages produce final models."
         )
 
+    @timed_stage(initial_phase="dispatch_and_preflight", kind="invocation")
     def run(self, stage: str) -> None:
         if stage not in self.STAGES:
             raise ValueError(f"Unknown stage {stage!r}. Choose from {', '.join(self.STAGES)}")
@@ -8228,6 +8265,7 @@ class TrainingPipeline:
                     print(f"  - {message}")
                 print("Close stale terminals/apps, restart failed Python/CUDA processes, then rerun.")
                 print("Override only if intentional: add --skip-preflight.")
+                self.timing.skip("machine preflight failed; no requested stages executed")
                 return
             print("Preflight check passed.")
             for message in result.messages:

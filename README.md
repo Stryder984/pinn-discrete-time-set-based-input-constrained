@@ -41,6 +41,46 @@ See `requirements.txt` for the lightweight Python package list. The verifier bac
 
 ## Notes
 
+### Training Times and Final Losses
+
+New runs automatically write `timings/<UTC timestamp>_<unique ID>.json`.
+Each top-level pipeline invocation (including a direct stage-method call) gets
+a separate journal, so reruns never overwrite earlier timings. No historical
+timings are inferred from file timestamps.
+
+The journal records hardware/software metadata, start/end UTC timestamps,
+wall-clock seconds, stage status, and nested stage IDs. Status is `complete`,
+`failed`, `interrupted`, or `skipped`; a forcibly terminated process can leave
+`running`, which must not be treated as completed. Journals are atomically
+updated at coarse phase boundaries, not every epoch. Failed writes emit a
+warning and do not intentionally abort training.
+
+Each training stage separates `data_preparation` (sampling, labels, model and
+batch setup), `optimization` (the existing epoch loop, including its logging
+and PiNet's periodic evaluations), and checkpoint/report/plot work. Original
+omega additionally separates `domain_expansion`. Target plotting and combined
+loss-history writing/plotting are recorded separately from optimization.
+The threshold stage separates `threshold_search`, optional
+`quadratic_control_search`, and result serialization. Plot-stage time includes
+the diagnostic computations needed to construct those figures.
+
+CUDA is synchronized at timing boundaries, never per optimizer step. Times
+include CPU work, I/O and any competing machine load; they are not GPU-kernel
+times. The outer `run` event includes preflight and all dispatched stages, but
+not interpreter startup, imports or construction of the pipeline object.
+Parent times include nested stages: do not sum parent and child durations.
+Within each event, `phase_seconds` partitions its measured duration.
+
+Training events also copy `final_training_loss` from the last existing epoch
+record, with the total, components, epoch count and history filename. This is
+the batch-averaged weighted training loss, not an additional evaluation of the
+final checkpoint. Empty histories yield null loss; nonfinite values are null
+with their field names listed. Existing `*_loss_history.csv/json` files remain
+unchanged. Loss totals across different weights are not directly comparable.
+
+The instrumentation changes no dynamics, samples, losses, optimizer steps,
+controller behavior or thresholds. No CPU fallback is introduced.
+
 ### Optional Quadratic Control Diagnostic
 
 Set `quadratic_control_search_enabled=True` in the system's `TrainingConfig`
